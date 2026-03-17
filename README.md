@@ -17,7 +17,7 @@ Use Gemini CLI for web search and image recognition to reduce API costs.
 Register this marketplace in Claude Code:
 
 ```bash
-/plugin marketplace add LoadChange/skills
+/plugin marketplace add loadchange/skills
 ```
 
 Then install the skill:
