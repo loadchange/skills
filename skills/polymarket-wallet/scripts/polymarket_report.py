@@ -19,6 +19,8 @@ import json
 import re
 import sys
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -31,6 +33,73 @@ HEADERS = {
     "Accept": "application/json",
 }
 TODAY = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+ADDR_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+def resolve_username(name: str) -> str:
+    """Resolve a Polymarket display name to a proxy wallet address via gamma-api.
+
+    The public-search endpoint is fuzzy (e.g. ``ColdMath`` also matches
+    ``coldmath.i``), so we collect profiles whose ``name`` matches case-insensitively
+    and require exactly one hit. Display names are not unique across profiles, so a
+    multi-match is a hard error — picking one arbitrarily would silently run the
+    report against the wrong wallet, which is the nastiest failure mode to debug.
+
+    Exits with ``sys.exit(1)`` on any failure (network, zero matches, multiple
+    matches, missing ``proxyWallet``). The caller cannot proceed without a wallet.
+    """
+    url = (
+        f"{GAMMA_API}/public-search"
+        f"?q={urllib.parse.quote(name, safe='')}"
+        f"&search_profiles=true&limit_per_type=1"
+    )
+    req = urllib.request.Request(url, headers=HEADERS)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        print(f"Error resolving username '{name}': HTTP {e.code} {e.reason}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error resolving username '{name}': {e.__class__.__name__}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(data, dict):
+        print(f"Unexpected response shape from gamma-api for '{name}'.", file=sys.stderr)
+        sys.exit(1)
+    profiles = data.get("profiles")
+    if not isinstance(profiles, list):
+        profiles = []
+
+    target = name.lower()
+    exact = [
+        p for p in profiles
+        if isinstance(p, dict) and (p.get("name") or "").lower() == target
+    ]
+
+    if len(exact) == 1:
+        wallet = exact[0].get("proxyWallet")
+        if not wallet:
+            print(f"Profile '{name}' has no proxyWallet on record.", file=sys.stderr)
+            sys.exit(1)
+        print(f"Resolved username '{name}' → {wallet}", file=sys.stderr)
+        return wallet
+
+    if len(exact) > 1:
+        print(f"Multiple Polymarket profiles named '{name}':", file=sys.stderr)
+        for p in exact:
+            print(f"  - {p.get('name')} → {p.get('proxyWallet')}", file=sys.stderr)
+        print("Pass the exact 0x address to disambiguate.", file=sys.stderr)
+        sys.exit(1)
+
+    if profiles:
+        closest = ", ".join(
+            (p.get("name") or "?") for p in profiles[:5] if isinstance(p, dict)
+        )
+        print(f"No exact match for username '{name}'. Closest: {closest}", file=sys.stderr)
+    else:
+        print(f"No Polymarket profile found for username '{name}'.", file=sys.stderr)
+    sys.exit(1)
 
 
 def fetch_activities(wallet: str, start: str | None, end: str | None) -> list[dict]:
@@ -475,7 +544,11 @@ def generate_json_report(wallet: str, activities: list[dict], positions: dict[st
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Polymarket wallet trading report")
-    parser.add_argument("wallet", help="Wallet address (0x...)")
+    parser.add_argument(
+        "wallet",
+        metavar="WALLET_OR_NAME",
+        help="0x wallet address or Polymarket display name (e.g. ColdMath)",
+    )
     parser.add_argument("--start", help="Start date filter (YYYY-MM-DD)")
     parser.add_argument("--end", help="End date filter (YYYY-MM-DD)")
     parser.add_argument("--json", action="store_true", help="Output JSON instead of text")
@@ -483,8 +556,25 @@ def main() -> None:
                         help="Skip Gamma API checks (faster, less accurate)")
     args = parser.parse_args()
 
-    print(f"Fetching activities for {args.wallet}...", file=sys.stderr)
-    activities = fetch_activities(args.wallet, args.start, args.end)
+    raw = (args.wallet or "").strip()
+    if not raw:
+        parser.error("wallet cannot be empty")
+
+    # Auto-detect: anything starting with `0x`/`0X` is treated as an address;
+    # everything else is resolved as a Polymarket display name. We normalize the
+    # prefix to lowercase so the regex (which is already case-insensitive in the
+    # hex body) accepts `0X…` too.
+    if raw[:2].lower() == "0x":
+        normalized = "0x" + raw[2:]
+        if not ADDR_RE.match(normalized):
+            print(f"Invalid 0x address: {raw}", file=sys.stderr)
+            sys.exit(1)
+        wallet = normalized
+    else:
+        wallet = resolve_username(raw)
+
+    print(f"Fetching activities for {wallet}...", file=sys.stderr)
+    activities = fetch_activities(wallet, args.start, args.end)
     if not activities:
         print("No activities found for this wallet.", file=sys.stderr)
         sys.exit(1)
@@ -517,10 +607,10 @@ def main() -> None:
         classified = classify_positions(positions)
 
     if args.json:
-        report = generate_json_report(args.wallet, activities, positions, classified)
+        report = generate_json_report(wallet, activities, positions, classified)
         print(json.dumps(report, indent=2, ensure_ascii=False))
     else:
-        report = generate_report(args.wallet, activities, positions, classified)
+        report = generate_report(wallet, activities, positions, classified)
         print(report)
 
 
