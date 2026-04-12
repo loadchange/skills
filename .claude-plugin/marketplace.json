@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "LoadChange's personal skills marketplace",
-    "version": "1.0.0"
+    "version": "1.0.1"
   },
   "plugins": [
     {
@@ -16,6 +16,15 @@
       "strict": false,
       "skills": [
         "./skills/gemini-tools"
+      ]
+    },
+    {
+      "name": "polymarket-tools",
+      "description": "Use Polymarket API for market data",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/polymarket-wallet"
       ]
     }
   ]
