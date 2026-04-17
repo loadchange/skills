@@ -1,0 +1,25 @@
+# pyproject.toml for hyperliquid-analytics scripts.
+#
+# This file exists so editors and IDE tooling understand the dependency
+# envelope. It is NOT the source of truth for runtime deps — each script
+# declares its own dependencies via PEP 723 inline metadata at the top of
+# the file, and `uv run` reads those declarations, not this file.
+#
+# Runtime invocation is still:   uv run scripts/<name>.py [args]
+#
+# The only external dependency any script in this directory pulls is
+# hyperliquid-python-sdk (the official SDK). HyperEVM scripts (evm_*.py)
+# use the Python standard library exclusively (urllib, json, hashlib) —
+# no web3.py, no requests, no httpx. The stance is intentional: every
+# dependency is a potential supply-chain risk, so we only take the one
+# that's strictly required (the SDK) and vendor everything else with
+# stdlib.
+
+[project]
+name = "hyperliquid-analytics-scripts"
+version = "0.1.0"
+description = "Solidified scripts for querying Hyperliquid account data via the official SDK + stdlib-only HyperEVM RPC."
+requires-python = ">=3.10"
+dependencies = [
+    "hyperliquid-python-sdk",
+]

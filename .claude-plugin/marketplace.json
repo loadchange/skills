@@ -6,25 +6,18 @@
   },
   "metadata": {
     "description": "LoadChange's personal skills marketplace",
-    "version": "1.0.2"
+    "version": "1.0.3"
   },
   "plugins": [
     {
-      "name": "gemini-tools",
-      "description": "Use Gemini CLI for web search and image recognition to reduce API costs",
+      "name": "loadchange",
+      "description": "LoadChange's personal skills marketplace",
       "source": "./",
       "strict": false,
       "skills": [
-        "./skills/gemini-tools"
-      ]
-    },
-    {
-      "name": "polymarket-tools",
-      "description": "Use Polymarket API for market data",
-      "source": "./",
-      "strict": false,
-      "skills": [
-        "./skills/polymarket-wallet"
+        "./skills/gemini-tools",
+        "./skills/polymarket-wallet",
+        "./skills/hyperliquid-analytics"
       ]
     }
   ]
