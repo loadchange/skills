@@ -229,6 +229,68 @@ def _fmt_reddit_messages(msgs: list[dict]) -> str:
     return "\n".join(out).rstrip()
 
 
+def _fmt_geocode(payload: dict) -> str:
+    results = (payload.get("geocoding") or {}).get("result") or []
+    if not results:
+        return "(no results)"
+    out = []
+    for i, r in enumerate(results, 1):
+        name = r.get("name") or "?"
+        country = r.get("country") or "?"
+        lat = r.get("lat")
+        lon = r.get("lon")
+        coord = f"({lat:.4f}, {lon:.4f})" if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) else ""
+        out.append(f"{i}. {name} / {country} {coord}".rstrip())
+    return "\n".join(out)
+
+
+def _fmt_current(payload: dict, units: str) -> str:
+    cw = payload.get("get_current_weather") or {}
+    if not cw.get("name") and not cw.get("main"):
+        return "(no data)"
+    name = cw.get("name") or "?"
+    country = (cw.get("sys") or {}).get("country") or ""
+    weather = (cw.get("weather") or [{}])[0]
+    main = cw.get("main") or {}
+    wind = cw.get("wind") or {}
+    clouds = cw.get("clouds") or {}
+    unit_sym = {"metric": "°C", "imperial": "°F", "standard": "K"}.get(units, "°")
+    speed_unit = "mph" if units == "imperial" else "m/s"
+    head = f"# {name}{', ' + country if country else ''} — {weather.get('description') or '?'}"
+    lines = [
+        head,
+        f"  Temp: {main.get('temp')}{unit_sym} (feels like {main.get('feels_like')}{unit_sym}, {main.get('temp_min')}–{main.get('temp_max')}{unit_sym})",
+        f"  Humidity {main.get('humidity')}%, pressure {main.get('pressure')} hPa, clouds {clouds.get('all')}%",
+        f"  Wind {wind.get('speed')} {speed_unit} @ {wind.get('deg')}° (gust {wind.get('gust')})",
+    ]
+    vis = cw.get("visibility")
+    if vis is not None:
+        lines.append(f"  Visibility {vis} m")
+    return "\n".join(lines)
+
+
+def _fmt_forecast(payload: dict, units: str) -> str:
+    fc = payload.get("forecast") or {}
+    city = fc.get("city") or {}
+    items = fc.get("list") or []
+    if not items:
+        return "(no forecast)"
+    unit_sym = {"metric": "°C", "imperial": "°F", "standard": "K"}.get(units, "°")
+    out = [f"# {city.get('name') or '?'}, {city.get('country') or '?'} — {len(items)} × 3-hour slices"]
+    for it in items:
+        dt = it.get("dt_txt") or "?"
+        m = it.get("main") or {}
+        w = (it.get("weather") or [{}])[0]
+        pop = it.get("pop")
+        pop_str = f", pop {int(pop * 100)}%" if isinstance(pop, (int, float)) else ""
+        wind = it.get("wind") or {}
+        out.append(
+            f"  {dt} | {m.get('temp')}{unit_sym} (feels {m.get('feels_like')}{unit_sym}) | "
+            f"{w.get('description') or '?'} | humidity {m.get('humidity')}%, wind {wind.get('speed')}{pop_str}"
+        )
+    return "\n".join(out)
+
+
 def _extract_reddit_slot(payload: dict, slot: str, kind: str) -> list[dict]:
     """Pull the active slot's listing children out of the multi-slot envelope.
 
@@ -339,7 +401,7 @@ def cmd_sub_search(args):
 
 
 def cmd_inbox(args):
-    params = {"messageInbox": {"limit": str(args.limit), "sr_detail": "false"}}
+    params = {"messageInbox": {"limit": str(args.limit), "sr_detail": "true" if args.sr_detail else "false"}}
     payload = _run("reddit", params)
     if args.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -349,13 +411,59 @@ def cmd_inbox(args):
 
 
 def cmd_unread(args):
-    params = {"messageUnread": {"limit": str(args.limit), "sr_detail": "false"}}
+    params = {"messageUnread": {"limit": str(args.limit), "sr_detail": "true" if args.sr_detail else "false"}}
     payload = _run("reddit", params)
     if args.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     msgs = _extract_reddit_slot(payload, "messageUnread", "messages")
     print(_fmt_reddit_messages(msgs))
+
+
+def cmd_geocode(args):
+    # Note: upstream parameter name is misspelled "lmit", not "limit". Kept faithful.
+    params = {"geocoding": {"q": args.query, "lmit": str(args.limit)}}
+    payload = _run("weather", params)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(_fmt_geocode(payload))
+
+
+def cmd_current(args):
+    params = {
+        "get_current_weather": {
+            "lat": str(args.lat),
+            "lon": str(args.lon),
+            "lang": args.lang,
+            "mode": args.mode,
+            "units": args.units,
+        }
+    }
+    payload = _run("weather", params)
+    # Pretty formatter only understands JSON; if the user picks xml/html, dump raw.
+    if args.json or args.mode != "json":
+        print(json.dumps(payload, indent=2, ensure_ascii=False) if isinstance(payload, (dict, list)) else payload)
+        return
+    print(_fmt_current(payload, args.units))
+
+
+def cmd_forecast(args):
+    params = {
+        "forecast": {
+            "lat": str(args.lat),
+            "lon": str(args.lon),
+            "cnt": str(args.cnt),
+            "lang": args.lang,
+            "mode": args.mode,
+            "units": args.units,
+        }
+    }
+    payload = _run("weather", params)
+    if args.json or args.mode != "json":
+        print(json.dumps(payload, indent=2, ensure_ascii=False) if isinstance(payload, (dict, list)) else payload)
+        return
+    print(_fmt_forecast(payload, args.units))
 
 
 def cmd_raw(args):
@@ -419,13 +527,40 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("inbox", help="Authenticated user's inbox messages.")
     sp.add_argument("--limit", type=int, default=10)
+    sp.add_argument("--sr-detail", action="store_true", help="Expand subreddit details on each message (upstream sr_detail=true).")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_inbox)
 
     sp = sub.add_parser("unread", help="Authenticated user's unread messages.")
     sp.add_argument("--limit", type=int, default=10)
+    sp.add_argument("--sr-detail", action="store_true", help="Expand subreddit details on each message (upstream sr_detail=true).")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_unread)
+
+    sp = sub.add_parser("geocode", help="Resolve a place name to coordinates (weather.geocoding).")
+    sp.add_argument("query", help='Place name, e.g. "shanghai", "beijing", "London". Add ISO 3166 country code or US state code to disambiguate, e.g. "London,GB" or "Boston,MA,US".')
+    sp.add_argument("--limit", type=int, default=5, help="Number of locations to return (1..5; upstream caps at 5). Mapped to upstream `lmit`.")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_geocode)
+
+    sp = sub.add_parser("current", help="Current weather at a coordinate (weather.get_current_weather).")
+    sp.add_argument("lat", type=float)
+    sp.add_argument("lon", type=float)
+    sp.add_argument("--units", default="metric", choices=["metric", "imperial", "standard"], help="metric=°C (default), imperial=°F, standard=K.")
+    sp.add_argument("--lang", default="en", help='Output language, e.g. "en", "zh_cn".')
+    sp.add_argument("--mode", default="json", choices=["json", "xml"], help="Upstream response format (json default; xml supported). Non-json forces raw output (the pretty formatter only parses json).")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_current)
+
+    sp = sub.add_parser("forecast", help="5-day / 3-hour forecast at a coordinate (weather.forecast).")
+    sp.add_argument("lat", type=float)
+    sp.add_argument("lon", type=float)
+    sp.add_argument("--cnt", type=int, default=8, help="Number of timestamps (3-hour slices) to return; default 8 = next 24h. Upstream cap depends on the OpenWeatherMap plan (5-day endpoint allows up to 40).")
+    sp.add_argument("--units", default="metric", choices=["metric", "imperial", "standard"])
+    sp.add_argument("--lang", default="en")
+    sp.add_argument("--mode", default="json", choices=["json", "xml"], help="Upstream response format (json default; xml supported). Non-json forces raw output.")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_forecast)
 
     sp = sub.add_parser(
         "raw",
