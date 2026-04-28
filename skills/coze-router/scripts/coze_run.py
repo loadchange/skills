@@ -305,6 +305,95 @@ def _extract_reddit_slot(payload: dict, slot: str, kind: str) -> list[dict]:
     return listing.get("children") or []
 
 
+def _extract_youtube_slot(payload: dict, slot: str) -> dict | None:
+    """Pull the active slot's `data` dict out of the youtube envelope.
+
+    YouTube slots wrap the upstream payload one extra level: each slot is
+    {data, log_id, message, status_code}, where `data` is null for the
+    not-invoked methods. Returns None if no data / a non-success status.
+    """
+    slot_obj = payload.get(slot) or {}
+    status = slot_obj.get("status_code")
+    if status not in (None, 0):
+        msg = slot_obj.get("message") or "unknown error"
+        print(f"YouTube {slot} failed (status_code={status}): {msg}", file=sys.stderr)
+        return None
+    return slot_obj.get("data")
+
+
+def _fmt_yt_search(payload: dict) -> str:
+    data = _extract_youtube_slot(payload, "search_video") or {}
+    items = data.get("items") or []
+    if not items:
+        return "(no results)"
+    out = []
+    for i, item in enumerate(items, 1):
+        sn = item.get("snippet") or {}
+        title = (sn.get("title") or "(untitled)").strip()
+        channel = sn.get("channelTitle") or "?"
+        published = sn.get("publishedAt") or sn.get("publishTime") or ""
+        vid = (item.get("id") or {}).get("videoId") or ""
+        url = item.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
+        desc = (sn.get("description") or "").strip()
+        if len(desc) > 240:
+            desc = desc[:240].rstrip() + "…"
+        out.append(f"{i}. {title}")
+        meta = [channel]
+        if published:
+            meta.append(published[:10])  # YYYY-MM-DD
+        if vid:
+            meta.append(vid)
+        out.append("   " + " · ".join(meta))
+        if url:
+            out.append(f"   {url}")
+        if desc:
+            out.append(_wrap(desc, indent="   "))
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+def _fmt_yt_meta(payload: dict) -> str:
+    data = _extract_youtube_slot(payload, "get_video_meta") or {}
+    items = data.get("items") or []
+    if not items:
+        return "(no video found)"
+    item = items[0]
+    sn = item.get("snippet") or {}
+    title = (sn.get("title") or "(untitled)").strip()
+    channel = sn.get("channelTitle") or "?"
+    published = sn.get("publishedAt") or ""
+    lang = sn.get("defaultAudioLanguage") or ""
+    vid = item.get("id") or ""
+    url = item.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
+    desc = (sn.get("description") or "").strip()
+    lines = [f"# {title}"]
+    meta = [channel]
+    if published:
+        meta.append(published[:10])
+    if lang:
+        meta.append(f"audio:{lang}")
+    if vid:
+        meta.append(vid)
+    lines.append("  " + " · ".join(meta))
+    if url:
+        lines.append(f"  {url}")
+    if desc:
+        lines.append("")
+        lines.append(_wrap(desc, indent="  "))
+    return "\n".join(lines)
+
+
+def _fmt_yt_caption(payload: dict) -> str:
+    data = _extract_youtube_slot(payload, "get_caption") or {}
+    title = (data.get("title") or "").strip()
+    caption = (data.get("caption") or "").strip()
+    if not title and not caption:
+        return "(no captions available — upstream returned an empty title and transcript; the video may not have captions enabled)"
+    header = f"# {title}\n\n" if title else ""
+    body = f"{header}{caption}".rstrip()
+    return body or "(captions field present but empty)"
+
+
 # --- Subcommands --------------------------------------------------------------
 
 def cmd_list(args):
@@ -466,6 +555,30 @@ def cmd_forecast(args):
     print(_fmt_forecast(payload, args.units))
 
 
+def cmd_yt_search(args):
+    payload = _run("youtube", {"search_video": {"q": args.query}})
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(_fmt_yt_search(payload))
+
+
+def cmd_yt_meta(args):
+    payload = _run("youtube", {"get_video_meta": {"id": args.video_id}})
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(_fmt_yt_meta(payload))
+
+
+def cmd_yt_caption(args):
+    payload = _run("youtube", {"get_caption": {"video_id": args.video_id}})
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(_fmt_yt_caption(payload))
+
+
 def cmd_raw(args):
     try:
         params = json.loads(args.parameters)
@@ -562,11 +675,26 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_forecast)
 
+    sp = sub.add_parser("yt-search", help="Keyword search on YouTube (youtube.search_video).")
+    sp.add_argument("query", help='Search query, e.g. "claude opus 4.7".')
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_yt_search)
+
+    sp = sub.add_parser("yt-meta", help="Single-video metadata lookup (youtube.get_video_meta).")
+    sp.add_argument("video_id", help='YouTube video id, e.g. "tQO5lWhErUU" (the value after `v=` in the URL).')
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_yt_meta)
+
+    sp = sub.add_parser("yt-caption", help="Captions / transcript for a video (youtube.get_caption).")
+    sp.add_argument("video_id", help='YouTube video id, e.g. "tQO5lWhErUU". Returns empty when upstream cannot extract captions for the video.')
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_yt_caption)
+
     sp = sub.add_parser(
         "raw",
         help="Run any workflow with a raw JSON parameters blob; prints parsed JSON.",
     )
-    sp.add_argument("workflow", help="Workflow name, e.g. google_search, url_fetch, reddit.")
+    sp.add_argument("workflow", help="Workflow name, e.g. google_search, url_fetch, reddit, weather, youtube.")
     sp.add_argument("parameters", help="JSON object string for the workflow parameters.")
     sp.set_defaults(func=cmd_raw)
 
