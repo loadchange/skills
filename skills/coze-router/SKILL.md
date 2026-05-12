@@ -2,15 +2,21 @@
 name: coze-router
 description: >
   Call the Coze-based workflow router at d3q1e0dyfg5ace.cloudfront.net for web search
-  (google_search), URL-to-plaintext fetching (url_fetch), and Reddit browsing / search /
-  inbox (reddit). Use this skill whenever the user wants to: search the web through Coze,
-  read a specific web page's plaintext, list hot posts site-wide or inside a subreddit,
-  run a Reddit search (site-wide or scoped), or check their Reddit inbox / unread
-  messages. Also triggers on explicit mentions of "coze router", "workflow/list",
+  (google_search), URL-to-plaintext fetching (url_fetch), Reddit browsing / search /
+  inbox (reddit), weather lookups (weather: geocoding + current conditions +
+  5-day/3-hour forecast, OpenWeatherMap-backed), and YouTube lookups (youtube: keyword
+  video search + single-video metadata + captions/transcript). Use this skill whenever
+  the user wants to: search the web through Coze, read a specific web page's plaintext,
+  list hot posts site-wide or inside a subreddit, run a Reddit search (site-wide or
+  scoped), check their Reddit inbox / unread messages, resolve a place name to lat/lon,
+  get current weather / forecast for a coordinate, search YouTube videos by keyword,
+  fetch a YouTube video's metadata by id, or pull a YouTube video's captions /
+  transcript. Also triggers on explicit mentions of "coze router", "workflow/list",
   "workflow/run", the bearer token prefix `bvr_`, or phrases like "list Coze workflows",
-  "run the reddit workflow", "use the coze api". Prefer this skill over ad-hoc curl when
-  the user asks about any of the workflows the router exposes — the bundled script
-  already handles auth, envelope parsing, and per-workflow formatting.
+  "run the reddit workflow", "what's the weather in X via coze", "search YouTube via
+  coze", "use the coze api". Prefer this skill over ad-hoc curl when the user asks
+  about any of the workflows the router exposes — the bundled script already handles
+  auth, envelope parsing, and per-workflow formatting.
 ---
 
 # Coze Router
@@ -45,8 +51,22 @@ python3 <skill-path>/scripts/coze_run.py sub-hot ClaudeAI --limit 10
 python3 <skill-path>/scripts/coze_run.py sub-search ClaudeAI "MCP" --limit 5
 
 # Reddit inbox (requires the router's Reddit auth to be configured upstream)
-python3 <skill-path>/scripts/coze_run.py inbox --limit 10
-python3 <skill-path>/scripts/coze_run.py unread --limit 10
+# --sr-detail expands subreddit info on each message (upstream sr_detail=true)
+python3 <skill-path>/scripts/coze_run.py inbox --limit 10 [--sr-detail]
+python3 <skill-path>/scripts/coze_run.py unread --limit 10 [--sr-detail]
+
+# Weather: resolve a place name to lat/lon
+python3 <skill-path>/scripts/coze_run.py geocode "Beijing" --limit 3
+
+# Weather: current conditions / 5-day forecast at a coordinate
+# Defaults: --units=metric (°C), --lang=en, --mode=json. --mode=xml forces raw output.
+python3 <skill-path>/scripts/coze_run.py current 39.9042 116.4074 [--units imperial] [--lang zh_cn] [--mode xml]
+python3 <skill-path>/scripts/coze_run.py forecast 48.8566 2.3522 --cnt 8 [--units imperial] [--lang zh_cn] [--mode xml]
+
+# YouTube: keyword search / single-video metadata / captions
+python3 <skill-path>/scripts/coze_run.py yt-search "claude opus 4.7"
+python3 <skill-path>/scripts/coze_run.py yt-meta tQO5lWhErUU
+python3 <skill-path>/scripts/coze_run.py yt-caption tQO5lWhErUU
 
 # Escape hatch: run any workflow with a raw JSON params blob, returns parsed JSON
 python3 <skill-path>/scripts/coze_run.py raw google_search '{"googleWebSearch":{"query":"x","num":3}}'
@@ -92,8 +112,8 @@ Pass **exactly one** of these method namespaces as the `parameters` object:
 | `redditSearch`    | `q`, `limit`                          | Site-wide search                         |
 | `subRedditHot`    | `subreddit`, `limit`                  | Hot posts in a subreddit                 |
 | `subRedditSearch` | `subreddit`, `q`, `limit`             | Search inside a subreddit                |
-| `messageInbox`    | `limit`, optional `sr_detail`         | Authenticated user's inbox               |
-| `messageUnread`   | `limit`, optional `sr_detail`         | Authenticated user's unread messages     |
+| `messageInbox`    | `limit`, optional `sr_detail` (`"true"`/`"false"`)   | Authenticated user's inbox          |
+| `messageUnread`   | `limit`, optional `sr_detail` (`"true"`/`"false"`)   | Authenticated user's unread messages|
 
 **All values are strings** — including numeric limits (`"10"`, not `10`). The CLI
 handles the stringification for you.
@@ -105,6 +125,77 @@ listing lives at `<slot>.data.postData.data.children[]`; for message slots at
 
 Per-post fields surfaced: `title`, `subreddit_name_prefixed`, `author`, `score`,
 `num_comments`, `link_flair_text`, `permalink`, `url_overridden_by_dest`, `selftext`.
+
+### 4. `weather` (router with 3 sub-methods, OpenWeatherMap-backed)
+
+Pass **exactly one** of these method namespaces as the `parameters` object — the other
+two keys must be omitted entirely (don't send them as null/empty):
+
+| Method                | Required params       | Optional params               | What it does                          |
+|-----------------------|-----------------------|-------------------------------|---------------------------------------|
+| `geocoding`           | `q`                   | `lmit`                        | Place name → list of {name, country, lat, lon} |
+| `get_current_weather` | `lat`, `lon`          | `lang`, `mode`, `units`       | Current conditions at a coordinate    |
+| `forecast`            | `lat`, `lon`          | `cnt`, `lang`, `mode`, `units`| 5-day / 3-hour forecast               |
+
+**All values are strings** (the CLI handles stringification). Per-parameter detail
+(taken from the upstream OpenWeatherMap docs):
+
+- **`q`** — Place name. A bare city name like `"shanghai"`, `"beijing"`, or `"London"`
+  works fine. Optionally append a country code (ISO 3166) or, for US locations, a
+  state code, to disambiguate ambiguous names — e.g. `"London,GB"` to avoid London,
+  Ontario, or `"Boston,MA,US"` to pin a specific Boston.
+- **`lmit`** — Number of locations to return for `geocoding`, **upstream caps at 5**.
+  The misspelling is real — that's the actual upstream parameter name. The CLI
+  exposes it as `--limit` and rewrites internally.
+- **`lat` / `lon`** — Latitude / longitude as decimal-string degrees.
+- **`cnt`** — Number of timestamps (3-hour slices) returned by `forecast`. The
+  5-day/3-hour endpoint typically caps at 40 (5 days × 8 slices/day) but the exact
+  ceiling depends on the upstream plan.
+- **`units`** — `"standard"` (Kelvin, **upstream default**), `"metric"` (°C), or
+  `"imperial"` (°F). The CLI defaults to `metric`.
+- **`mode`** — Response format: `"json"` (default) or `"xml"`. The pretty formatter
+  only parses JSON, so the CLI automatically falls back to raw output when
+  `--mode xml` is used (regardless of `--json`).
+- **`lang`** — Output language code (e.g. `"en"`, `"zh_cn"`); see OpenWeatherMap's
+  multilingual list for the full set.
+
+The response envelope always contains all three slot keys (`geocoding`, `forecast`,
+`get_current_weather`); only the invoked one is populated, the others are null. The
+script unwraps this automatically.
+
+Per-call fields surfaced by the formatter:
+- **geocoding** → `name`, `country`, `lat`, `lon` (one row per result)
+- **current** → `name`, `sys.country`, `weather[0].description`, `main.{temp,feels_like,humidity,pressure}`, `wind.{speed,deg,gust}`, `clouds.all`, `visibility`
+- **forecast** → `city.{name,country}`, then per slice `dt_txt`, `main.{temp,feels_like,humidity}`, `weather[0].description`, `pop`, `wind.speed`
+
+### 5. `youtube` (router with 3 sub-methods, YouTube Data API-backed)
+
+Pass **exactly one** of these method namespaces as the `parameters` object — the other
+two keys must be omitted entirely (don't send them as null/empty):
+
+| Method            | Required params | What it does                                                |
+|-------------------|-----------------|-------------------------------------------------------------|
+| `search_video`    | `q`             | Keyword search, returns a list of videos                    |
+| `get_video_meta`  | `id`            | Single-video metadata lookup by video id                    |
+| `get_caption`     | `video_id`      | Captions / transcript for a video (may be empty if disabled)|
+
+The response envelope always contains all three slot keys (`search_video`,
+`get_video_meta`, `get_caption`) plus an `error` slot; only the invoked method is
+populated, the others have `data: null`. Successful slots have `status_code: 0` and
+`message: "success"`. The script unwraps this automatically.
+
+Per-call fields surfaced by the formatter:
+- **yt-search** → per item `snippet.title`, `snippet.channelTitle`, `id.videoId`,
+  `snippet.publishedAt`, `url`, truncated `snippet.description`
+- **yt-meta** → `snippet.title`, `snippet.channelTitle`, `snippet.publishedAt`,
+  `snippet.defaultAudioLanguage`, `url`, full `snippet.description`
+- **yt-caption** → `title` + `caption` (raw transcript text). Many videos return empty
+  strings — captions are only available when the upstream successfully extracted
+  them; warn the user when both fields are blank.
+
+> **Note:** unlike `weather`, the youtube envelope nests its useful payload one extra
+> level deep — under `<slot>.data`, with sibling `status_code` / `message` / `log_id`
+> fields. The script's `_extract_youtube_slot` helper handles this.
 
 ## Response Envelope (for `raw` / debugging)
 

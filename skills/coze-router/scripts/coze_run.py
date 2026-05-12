@@ -229,6 +229,68 @@ def _fmt_reddit_messages(msgs: list[dict]) -> str:
     return "\n".join(out).rstrip()
 
 
+def _fmt_geocode(payload: dict) -> str:
+    results = (payload.get("geocoding") or {}).get("result") or []
+    if not results:
+        return "(no results)"
+    out = []
+    for i, r in enumerate(results, 1):
+        name = r.get("name") or "?"
+        country = r.get("country") or "?"
+        lat = r.get("lat")
+        lon = r.get("lon")
+        coord = f"({lat:.4f}, {lon:.4f})" if isinstance(lat, (int, float)) and isinstance(lon, (int, float)) else ""
+        out.append(f"{i}. {name} / {country} {coord}".rstrip())
+    return "\n".join(out)
+
+
+def _fmt_current(payload: dict, units: str) -> str:
+    cw = payload.get("get_current_weather") or {}
+    if not cw.get("name") and not cw.get("main"):
+        return "(no data)"
+    name = cw.get("name") or "?"
+    country = (cw.get("sys") or {}).get("country") or ""
+    weather = (cw.get("weather") or [{}])[0]
+    main = cw.get("main") or {}
+    wind = cw.get("wind") or {}
+    clouds = cw.get("clouds") or {}
+    unit_sym = {"metric": "°C", "imperial": "°F", "standard": "K"}.get(units, "°")
+    speed_unit = "mph" if units == "imperial" else "m/s"
+    head = f"# {name}{', ' + country if country else ''} — {weather.get('description') or '?'}"
+    lines = [
+        head,
+        f"  Temp: {main.get('temp')}{unit_sym} (feels like {main.get('feels_like')}{unit_sym}, {main.get('temp_min')}–{main.get('temp_max')}{unit_sym})",
+        f"  Humidity {main.get('humidity')}%, pressure {main.get('pressure')} hPa, clouds {clouds.get('all')}%",
+        f"  Wind {wind.get('speed')} {speed_unit} @ {wind.get('deg')}° (gust {wind.get('gust')})",
+    ]
+    vis = cw.get("visibility")
+    if vis is not None:
+        lines.append(f"  Visibility {vis} m")
+    return "\n".join(lines)
+
+
+def _fmt_forecast(payload: dict, units: str) -> str:
+    fc = payload.get("forecast") or {}
+    city = fc.get("city") or {}
+    items = fc.get("list") or []
+    if not items:
+        return "(no forecast)"
+    unit_sym = {"metric": "°C", "imperial": "°F", "standard": "K"}.get(units, "°")
+    out = [f"# {city.get('name') or '?'}, {city.get('country') or '?'} — {len(items)} × 3-hour slices"]
+    for it in items:
+        dt = it.get("dt_txt") or "?"
+        m = it.get("main") or {}
+        w = (it.get("weather") or [{}])[0]
+        pop = it.get("pop")
+        pop_str = f", pop {int(pop * 100)}%" if isinstance(pop, (int, float)) else ""
+        wind = it.get("wind") or {}
+        out.append(
+            f"  {dt} | {m.get('temp')}{unit_sym} (feels {m.get('feels_like')}{unit_sym}) | "
+            f"{w.get('description') or '?'} | humidity {m.get('humidity')}%, wind {wind.get('speed')}{pop_str}"
+        )
+    return "\n".join(out)
+
+
 def _extract_reddit_slot(payload: dict, slot: str, kind: str) -> list[dict]:
     """Pull the active slot's listing children out of the multi-slot envelope.
 
@@ -241,6 +303,95 @@ def _extract_reddit_slot(payload: dict, slot: str, kind: str) -> list[dict]:
     inner_key = "postData" if kind == "posts" else "messageData"
     listing = (slot_data.get(inner_key) or {}).get("data") or {}
     return listing.get("children") or []
+
+
+def _extract_youtube_slot(payload: dict, slot: str) -> dict | None:
+    """Pull the active slot's `data` dict out of the youtube envelope.
+
+    YouTube slots wrap the upstream payload one extra level: each slot is
+    {data, log_id, message, status_code}, where `data` is null for the
+    not-invoked methods. Returns None if no data / a non-success status.
+    """
+    slot_obj = payload.get(slot) or {}
+    status = slot_obj.get("status_code")
+    if status not in (None, 0):
+        msg = slot_obj.get("message") or "unknown error"
+        print(f"YouTube {slot} failed (status_code={status}): {msg}", file=sys.stderr)
+        return None
+    return slot_obj.get("data")
+
+
+def _fmt_yt_search(payload: dict) -> str:
+    data = _extract_youtube_slot(payload, "search_video") or {}
+    items = data.get("items") or []
+    if not items:
+        return "(no results)"
+    out = []
+    for i, item in enumerate(items, 1):
+        sn = item.get("snippet") or {}
+        title = (sn.get("title") or "(untitled)").strip()
+        channel = sn.get("channelTitle") or "?"
+        published = sn.get("publishedAt") or sn.get("publishTime") or ""
+        vid = (item.get("id") or {}).get("videoId") or ""
+        url = item.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
+        desc = (sn.get("description") or "").strip()
+        if len(desc) > 240:
+            desc = desc[:240].rstrip() + "…"
+        out.append(f"{i}. {title}")
+        meta = [channel]
+        if published:
+            meta.append(published[:10])  # YYYY-MM-DD
+        if vid:
+            meta.append(vid)
+        out.append("   " + " · ".join(meta))
+        if url:
+            out.append(f"   {url}")
+        if desc:
+            out.append(_wrap(desc, indent="   "))
+        out.append("")
+    return "\n".join(out).rstrip()
+
+
+def _fmt_yt_meta(payload: dict) -> str:
+    data = _extract_youtube_slot(payload, "get_video_meta") or {}
+    items = data.get("items") or []
+    if not items:
+        return "(no video found)"
+    item = items[0]
+    sn = item.get("snippet") or {}
+    title = (sn.get("title") or "(untitled)").strip()
+    channel = sn.get("channelTitle") or "?"
+    published = sn.get("publishedAt") or ""
+    lang = sn.get("defaultAudioLanguage") or ""
+    vid = item.get("id") or ""
+    url = item.get("url") or (f"https://www.youtube.com/watch?v={vid}" if vid else "")
+    desc = (sn.get("description") or "").strip()
+    lines = [f"# {title}"]
+    meta = [channel]
+    if published:
+        meta.append(published[:10])
+    if lang:
+        meta.append(f"audio:{lang}")
+    if vid:
+        meta.append(vid)
+    lines.append("  " + " · ".join(meta))
+    if url:
+        lines.append(f"  {url}")
+    if desc:
+        lines.append("")
+        lines.append(_wrap(desc, indent="  "))
+    return "\n".join(lines)
+
+
+def _fmt_yt_caption(payload: dict) -> str:
+    data = _extract_youtube_slot(payload, "get_caption") or {}
+    title = (data.get("title") or "").strip()
+    caption = (data.get("caption") or "").strip()
+    if not title and not caption:
+        return "(no captions available — upstream returned an empty title and transcript; the video may not have captions enabled)"
+    header = f"# {title}\n\n" if title else ""
+    body = f"{header}{caption}".rstrip()
+    return body or "(captions field present but empty)"
 
 
 # --- Subcommands --------------------------------------------------------------
@@ -339,7 +490,7 @@ def cmd_sub_search(args):
 
 
 def cmd_inbox(args):
-    params = {"messageInbox": {"limit": str(args.limit), "sr_detail": "false"}}
+    params = {"messageInbox": {"limit": str(args.limit), "sr_detail": "true" if args.sr_detail else "false"}}
     payload = _run("reddit", params)
     if args.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
@@ -349,13 +500,83 @@ def cmd_inbox(args):
 
 
 def cmd_unread(args):
-    params = {"messageUnread": {"limit": str(args.limit), "sr_detail": "false"}}
+    params = {"messageUnread": {"limit": str(args.limit), "sr_detail": "true" if args.sr_detail else "false"}}
     payload = _run("reddit", params)
     if args.json:
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return
     msgs = _extract_reddit_slot(payload, "messageUnread", "messages")
     print(_fmt_reddit_messages(msgs))
+
+
+def cmd_geocode(args):
+    # Note: upstream parameter name is misspelled "lmit", not "limit". Kept faithful.
+    params = {"geocoding": {"q": args.query, "lmit": str(args.limit)}}
+    payload = _run("weather", params)
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(_fmt_geocode(payload))
+
+
+def cmd_current(args):
+    params = {
+        "get_current_weather": {
+            "lat": str(args.lat),
+            "lon": str(args.lon),
+            "lang": args.lang,
+            "mode": args.mode,
+            "units": args.units,
+        }
+    }
+    payload = _run("weather", params)
+    # Pretty formatter only understands JSON; if the user picks xml/html, dump raw.
+    if args.json or args.mode != "json":
+        print(json.dumps(payload, indent=2, ensure_ascii=False) if isinstance(payload, (dict, list)) else payload)
+        return
+    print(_fmt_current(payload, args.units))
+
+
+def cmd_forecast(args):
+    params = {
+        "forecast": {
+            "lat": str(args.lat),
+            "lon": str(args.lon),
+            "cnt": str(args.cnt),
+            "lang": args.lang,
+            "mode": args.mode,
+            "units": args.units,
+        }
+    }
+    payload = _run("weather", params)
+    if args.json or args.mode != "json":
+        print(json.dumps(payload, indent=2, ensure_ascii=False) if isinstance(payload, (dict, list)) else payload)
+        return
+    print(_fmt_forecast(payload, args.units))
+
+
+def cmd_yt_search(args):
+    payload = _run("youtube", {"search_video": {"q": args.query}})
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(_fmt_yt_search(payload))
+
+
+def cmd_yt_meta(args):
+    payload = _run("youtube", {"get_video_meta": {"id": args.video_id}})
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(_fmt_yt_meta(payload))
+
+
+def cmd_yt_caption(args):
+    payload = _run("youtube", {"get_caption": {"video_id": args.video_id}})
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return
+    print(_fmt_yt_caption(payload))
 
 
 def cmd_raw(args):
@@ -419,19 +640,61 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("inbox", help="Authenticated user's inbox messages.")
     sp.add_argument("--limit", type=int, default=10)
+    sp.add_argument("--sr-detail", action="store_true", help="Expand subreddit details on each message (upstream sr_detail=true).")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_inbox)
 
     sp = sub.add_parser("unread", help="Authenticated user's unread messages.")
     sp.add_argument("--limit", type=int, default=10)
+    sp.add_argument("--sr-detail", action="store_true", help="Expand subreddit details on each message (upstream sr_detail=true).")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=cmd_unread)
+
+    sp = sub.add_parser("geocode", help="Resolve a place name to coordinates (weather.geocoding).")
+    sp.add_argument("query", help='Place name, e.g. "shanghai", "beijing", "London". Add ISO 3166 country code or US state code to disambiguate, e.g. "London,GB" or "Boston,MA,US".')
+    sp.add_argument("--limit", type=int, default=5, help="Number of locations to return (1..5; upstream caps at 5). Mapped to upstream `lmit`.")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_geocode)
+
+    sp = sub.add_parser("current", help="Current weather at a coordinate (weather.get_current_weather).")
+    sp.add_argument("lat", type=float)
+    sp.add_argument("lon", type=float)
+    sp.add_argument("--units", default="metric", choices=["metric", "imperial", "standard"], help="metric=°C (default), imperial=°F, standard=K.")
+    sp.add_argument("--lang", default="en", help='Output language, e.g. "en", "zh_cn".')
+    sp.add_argument("--mode", default="json", choices=["json", "xml"], help="Upstream response format (json default; xml supported). Non-json forces raw output (the pretty formatter only parses json).")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_current)
+
+    sp = sub.add_parser("forecast", help="5-day / 3-hour forecast at a coordinate (weather.forecast).")
+    sp.add_argument("lat", type=float)
+    sp.add_argument("lon", type=float)
+    sp.add_argument("--cnt", type=int, default=8, help="Number of timestamps (3-hour slices) to return; default 8 = next 24h. Upstream cap depends on the OpenWeatherMap plan (5-day endpoint allows up to 40).")
+    sp.add_argument("--units", default="metric", choices=["metric", "imperial", "standard"])
+    sp.add_argument("--lang", default="en")
+    sp.add_argument("--mode", default="json", choices=["json", "xml"], help="Upstream response format (json default; xml supported). Non-json forces raw output.")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_forecast)
+
+    sp = sub.add_parser("yt-search", help="Keyword search on YouTube (youtube.search_video).")
+    sp.add_argument("query", help='Search query, e.g. "claude opus 4.7".')
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_yt_search)
+
+    sp = sub.add_parser("yt-meta", help="Single-video metadata lookup (youtube.get_video_meta).")
+    sp.add_argument("video_id", help='YouTube video id, e.g. "tQO5lWhErUU" (the value after `v=` in the URL).')
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_yt_meta)
+
+    sp = sub.add_parser("yt-caption", help="Captions / transcript for a video (youtube.get_caption).")
+    sp.add_argument("video_id", help='YouTube video id, e.g. "tQO5lWhErUU". Returns empty when upstream cannot extract captions for the video.')
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_yt_caption)
 
     sp = sub.add_parser(
         "raw",
         help="Run any workflow with a raw JSON parameters blob; prints parsed JSON.",
     )
-    sp.add_argument("workflow", help="Workflow name, e.g. google_search, url_fetch, reddit.")
+    sp.add_argument("workflow", help="Workflow name, e.g. google_search, url_fetch, reddit, weather, youtube.")
     sp.add_argument("parameters", help="JSON object string for the workflow parameters.")
     sp.set_defaults(func=cmd_raw)
 
