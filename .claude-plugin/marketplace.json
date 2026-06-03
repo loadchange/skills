@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "LoadChange's personal skills marketplace",
-    "version": "1.0.3"
+    "version": "1.0.4"
   },
   "plugins": [
     {
@@ -17,7 +17,8 @@
       "skills": [
         "./skills/gemini-tools",
         "./skills/polymarket-wallet",
-        "./skills/hyperliquid-analytics"
+        "./skills/hyperliquid-analytics",
+        "./skills/drawio-diagram"
       ]
     }
   ]
