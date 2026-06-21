@@ -244,9 +244,9 @@ Env var overrides (mostly for ad-hoc testing):
 
 ## When to Use vs. Alternatives
 
-- For general web search, `gemini-tools` (Gemini CLI) is the default cost-saver. Prefer
+- For general web search, `agy-tools` (Antigravity CLI) is the default. Prefer
   this skill when the user explicitly wants the Coze router, when they need Reddit
-  data (Gemini can't do that), or when they want the raw plaintext of a specific URL
+  data (Antigravity CLI can't do that directly), or when they want the raw plaintext of a specific URL
   through the router's `url_fetch`.
 - For reading arbitrary web pages when you just need the content in-context, the
   built-in `WebFetch` tool is usually simpler. Reach for `url_fetch` here only when the
