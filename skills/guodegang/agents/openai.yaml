@@ -1,0 +1,4 @@
+interface:
+  display_name: "郭德纲京味说书幽默"
+  short_description: "把素材写成有说书节奏、生活歪理和回旋包袱的原创中文"
+  default_prompt: "使用 $guodegang 把这段内容改写成原创的京味说书式幽默口吻。"
