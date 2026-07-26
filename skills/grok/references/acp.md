@@ -151,6 +151,19 @@ the source of truth, and why the skill prints the query trace separately.
 Web search calls use `variant:"WebSearch"` with `rawOutput.action.type` of
 `search` (`.query`, `.sources[].url`), `open_page` (`.url`), or `find`.
 
+Media tools (`image_gen`, `image_edit`, `image_to_video`, `reference_to_video`)
+are ordinary client-side tools, so unlike the hosted search tools they return a
+real artifact:
+
+```json
+{"type": "ImageGen", "path": "/Users/me/.grok/sessions/<enc-cwd>/<session>/images/1.jpg",
+ "filename": "1.jpg", "session_folder": "images"}
+```
+
+`type` is one of `ImageGen` / `ImageEdit` / `ImageToVideo` / `ReferenceToVideo`.
+`uploaded_url` replaces `path` when the file went to a presigned URL instead of
+disk (ZDR video output). See `references/media.md`.
+
 ## Agent → client requests
 
 With `--always-approve` and `fs`/`terminal` capabilities off, none should arrive.

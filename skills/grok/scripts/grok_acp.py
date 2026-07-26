@@ -28,6 +28,13 @@ from typing import Any, Callable, Iterable
 # --------------------------------------------------------------------------- #
 
 DEFAULT_TIMEOUT = 300
+MEDIA_TIMEOUT = 600
+HEARTBEAT_SECS = 8.0
+
+# ToolOutput variants that carry a saved media file (see MediaGenOutput).
+MEDIA_OUTPUT_TYPES = {"ImageGen", "ImageEdit", "ImageToVideo", "ReferenceToVideo"}
+MEDIA_EXT = {"ImageGen": ".jpg", "ImageEdit": ".jpg", "ImageToVideo": ".mp4", "ReferenceToVideo": ".mp4"}
+MEDIA_STEM = {"ImageGen": "grok-image", "ImageEdit": "grok-edit", "ImageToVideo": "grok-video", "ReferenceToVideo": "grok-video"}
 
 
 def find_grok() -> str:
@@ -81,6 +88,7 @@ class GrokAgent:
         model: str | None = None,
         effort: str | None = None,
         always_approve: bool = True,
+        leader: bool = False,
         raw_log: str | None = None,
         on_progress: Callable[[str], None] | None = None,
     ) -> None:
@@ -89,10 +97,13 @@ class GrokAgent:
         self.model = model
         self.effort = effort
         self.always_approve = always_approve
+        self.leader = leader
         self.on_progress = on_progress or (lambda _m: None)
         self.raw_log = open(raw_log, "w", encoding="utf-8") if raw_log else None
 
         self.proc: subprocess.Popen[str] | None = None
+        self._stream: Any = None  # where answer text is being streamed, if anywhere
+        self._mid_line = False  # streamed text is sitting on an unterminated line
         self._q: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self._stderr: list[str] = []
         self._next_id = 0
@@ -109,6 +120,9 @@ class GrokAgent:
             cmd += ["--reasoning-effort", self.effort]
         if self.always_approve:
             cmd += ["--always-approve"]
+        # The leader is a shared resident process: it skips most of the ~1.6s
+        # cold start, at the cost of leaving a daemon running between calls.
+        cmd += ["--leader"] if self.leader else ["--no-leader"]
         cmd += ["stdio"]
 
         self.proc = subprocess.Popen(
@@ -174,6 +188,14 @@ class GrokAgent:
             self.raw_log.write(s + "\n")
             self.raw_log.flush()
 
+    def _progress(self, msg: str) -> None:
+        """Report progress, breaking the streamed line first so the two interleave cleanly."""
+        if self._stream and self._mid_line:
+            self._stream.write("\n")
+            self._stream.flush()
+            self._mid_line = False
+        self.on_progress(msg)
+
     def _send(self, obj: dict[str, Any]) -> None:
         assert self.proc and self.proc.stdin
         s = json.dumps(obj, ensure_ascii=False)
@@ -202,15 +224,24 @@ class GrokAgent:
         rid = self._next_id
         self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
 
-        deadline = time.monotonic() + timeout
+        start = time.monotonic()
+        deadline = start + timeout
+        last_beat = start
         while True:
-            remaining = deadline - time.monotonic()
+            now = time.monotonic()
+            remaining = deadline - now
             if remaining <= 0:
                 raise AcpError(f"timed out after {timeout:.0f}s waiting for {method}")
+            # Grok can go ~10s between the prompt and its first token. Without a
+            # sign of life that reads as a hang, so tick while nothing arrives.
+            if on_update and now - last_beat >= HEARTBEAT_SECS:
+                last_beat = now
+                self._progress(f"…{now - start:.0f}s")
             try:
                 msg = self._q.get(timeout=min(remaining, 1.0))
             except queue.Empty:
                 continue
+            last_beat = time.monotonic()
             if msg is None:
                 raise AcpError(self._exit_reason())
 
@@ -235,7 +266,7 @@ class GrokAgent:
                 (o for o in options if o.get("kind") == "allow_once"), None
             )
             if pick:
-                self.on_progress(f"permission auto-approved: {(msg.get('params') or {}).get('toolCall', {}).get('title', '')}")
+                self._progress(f"permission auto-approved: {(msg.get('params') or {}).get('toolCall', {}).get('title', '')}")
                 self._send({"jsonrpc": "2.0", "id": rid, "result": {"outcome": {"outcome": "selected", "optionId": pick["optionId"]}}})
                 return
             self._send({"jsonrpc": "2.0", "id": rid, "result": {"outcome": {"outcome": "cancelled"}}})
@@ -278,21 +309,45 @@ class GrokAgent:
         self.session_id = session_id
         return session_id
 
-    def prompt(self, text: str, meta: dict[str, Any] | None = None, timeout: float = DEFAULT_TIMEOUT) -> dict[str, Any]:
-        """Send one prompt turn; return the assembled answer, tool calls and usage."""
+    def prompt(
+        self,
+        text: str,
+        meta: dict[str, Any] | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+        stream: Any = None,
+        on_thought: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
+        """Send one prompt turn; return the assembled answer, tool calls, media and usage.
+
+        When `stream` is a writable file object, answer text is written to it as
+        it arrives instead of only at the end.
+        """
         if not self.session_id:
             raise AcpError("no session; call new_session() or load_session() first")
 
         segments: list[str] = []
         pending: list[str] = []
         tool_calls: dict[str, dict[str, Any]] = {}
+        media: list[dict[str, Any]] = []
         order: list[str] = []
         broke = [False]  # a tool call since the last text chunk => paragraph break
+        wrote = [False]
+        thought_seen = [False]
 
         def flush() -> None:
             if pending:
                 segments.append("".join(pending).strip())
                 pending.clear()
+
+        self._stream = stream
+        self._mid_line = False
+
+        def emit(s: str) -> None:
+            if stream and s:
+                stream.write(s)
+                stream.flush()
+                wrote[0] = True
+                self._mid_line = not s.endswith("\n")
 
         def on_update(u: dict[str, Any]) -> None:
             kind = u.get("sessionUpdate")
@@ -300,9 +355,20 @@ class GrokAgent:
                 if broke[0]:
                     flush()
                     broke[0] = False
-                pending.append((u.get("content") or {}).get("text") or "")
+                    if wrote[0]:
+                        emit("\n\n")
+                chunk = (u.get("content") or {}).get("text") or ""
+                pending.append(chunk)
+                emit(chunk)
             elif kind == "agent_thought_chunk":
-                pass
+                # The reasoning stream is usually the first sign of life, well
+                # before any answer text — surface at least that it started.
+                if not thought_seen[0]:
+                    thought_seen[0] = True
+                    if not on_thought:
+                        self._progress("thinking…")
+                if on_thought:
+                    on_thought((u.get("content") or {}).get("text") or "")
             elif kind in ("tool_call", "tool_call_update"):
                 broke[0] = True
                 tid = u.get("toolCallId") or ""
@@ -315,26 +381,43 @@ class GrokAgent:
                     # x_search: the sub-tool name plus a re-encoded JSON input string.
                     entry["name"] = raw_out["name"]
                     entry["input"] = _parse_maybe_json(raw_out.get("input"))
-                    self.on_progress(f"{entry['name']} {_compact(entry['input'])}")
+                    self._progress(f"{entry['name']} {_compact(entry['input'])}")
                 elif isinstance(raw_out.get("action"), dict):
                     # web_search: search / open_page / find, keyed by action.type.
                     action = raw_out["action"]
                     entry["name"] = f"web_{action.get('type') or 'search'}"
                     entry["input"] = action
-                    self.on_progress(f"{entry['name']} {_compact(action.get('query') or action.get('url') or action.get('pattern') or '')}")
+                    self._progress(f"{entry['name']} {_compact(action.get('query') or action.get('url') or action.get('pattern') or '')}")
+                elif raw_out.get("type") in MEDIA_OUTPUT_TYPES:
+                    # image_gen / image_edit / image_to_video / reference_to_video
+                    # land the file under the session folder; record it so the
+                    # caller can be handed a usable path.
+                    item = {
+                        "kind": raw_out["type"],
+                        "path": raw_out.get("path") or "",
+                        "filename": raw_out.get("filename") or "",
+                        "uploaded_url": raw_out.get("uploaded_url"),
+                    }
+                    media.append(item)
+                    entry["name"] = entry["name"] or raw_out["type"]
+                    self._progress(f"{raw_out['type']} saved {item['filename'] or item['uploaded_url'] or '?'}")
                 elif kind == "tool_call":
                     raw_in = u.get("rawInput") or {}
                     label = raw_in.get("variant") or u.get("title") or "tool"
                     entry["name"] = entry["name"] or (u.get("title") or "").rstrip(":") or label
-                    self.on_progress(f"{label} …")
+                    self._progress(f"{label} …")
 
         res = self.request("session/prompt", {"sessionId": self.session_id, "prompt": [{"type": "text", "text": text}], "_meta": meta or {}}, timeout=timeout, on_update=on_update)
         flush()
+        if self._mid_line:
+            emit("\n")
+        self._stream = None
 
         calls = [dict(tool_calls[t], id=t) for t in order]
         segments = [s for s in segments if s]
         return {
             "answer": "\n\n".join(segments),
+            "media": media,
             # One entry per assistant message. Under an outputSchema every message
             # (including the "still searching…" preambles) is schema-shaped, so the
             # real payload is the last one that parses.
@@ -395,94 +478,70 @@ SEARCH_PROFILE = {
     "agentsMd": False,
 }
 
+# These steer only where Grok's defaults fall short: it already knows the x_search
+# tools and X operator syntax (it reaches for conversation_id: and
+# in_reply_to_tweet_id: unprompted), so restating either just burns context.
+
 X_RULES = """\
-You are an X (Twitter) research engine. The caller is another AI agent that will
-act on your answer verbatim, so precision beats prose.
+You are an X (Twitter) research engine answering another agent, not a person.
 
-Hosted x_search sub-tools available to you:
-- x_keyword_search {query, limit, mode:"Latest"|"Top"} - full X advanced-search
-  operator syntax: from: to: @ since: until: min_faves: min_retweets: min_replies:
-  filter:links filter:media filter:images filter:videos filter:replies
-  -filter:replies filter:verified filter:quote lang: url: list: conversation_id:
-  "exact phrase", OR, -exclusion.
-- x_semantic_search {query, limit, usernames?} - meaning-based retrieval; use it
-  when the request is topical rather than lexical, or to catch posts that phrase
-  the idea differently.
-- x_user_search {query, count} - find accounts by name, handle, or description.
-- x_thread_fetch {post_id} - full text of a post plus its thread/reply context.
-
-Method:
-1. Translate the request into explicit operators. Reach for x_keyword_search when
-   accounts, dates, or exact phrases are named; x_semantic_search when the request
-   is about a topic or an idea. Run both when coverage matters.
-2. Run SEVERAL queries with different operator combinations, not one. Vary mode
-   between "Latest" (recency) and "Top" (reach). Widen or narrow after seeing
-   results.
-3. Call x_thread_fetch on any post that is truncated, is part of a thread, or is a
-   reply/quote whose context changes the meaning. Never summarize a post you have
-   not read in full.
-4. Stop when new queries stop returning new posts.
-
-Report:
-- Only what the tools returned. If a query came back empty, say so. Never invent a
-  post, ID, handle, date, or metric, and never reconstruct one from memory.
-- Cite every post as: @handle - YYYY-MM-DD - https://x.com/<handle>/status/<id>
-- Quote the post's own words for anything load-bearing. If you translate, keep the
-  original text alongside.
-- Include engagement counts (likes / reposts / replies / views) when the tool
-  returned them; omit the field rather than guessing.
-- Flag replies, quote-posts, and reposts as such.
-- Close with a "Queries run" list of the exact search strings you used, so the
-  caller can widen or re-run them.
+- Run several queries with different operators, across both "Latest" and "Top".
+  Keep going until new queries stop surfacing new posts.
+- Keyword search when accounts, dates, or exact phrases are named; semantic search
+  for topics and ideas; both when coverage matters.
+- x_thread_fetch anything truncated, threaded, or a reply/quote whose context
+  matters. Never summarize a post you have not read in full.
+- Report only what the tools returned, and say so when a query came back empty.
+  Never invent a post, ID, handle, date, or metric.
+- Cite every post as `@handle - YYYY-MM-DD - https://x.com/<handle>/status/<id>`,
+  quoting its own words, with engagement counts when the tool returned them.
 """
 
 WEB_RULES = """\
-You are a live web research engine. The caller is another AI agent that will act on
-your answer verbatim.
+You are a live web research engine answering another agent, not a person.
 
-- Search the live web; do not answer from memory. If your search returns nothing
-  usable, say so instead of filling the gap.
-- Run several differently-phrased queries before concluding. Fetch the primary
-  source rather than trusting a summary of it.
-- Cite every claim with a full URL, and give the publication date when the page
-  shows one.
-- Separate what the sources state from what you infer. Mark disagreement between
-  sources rather than averaging it away.
-- Close with a "Sources" list of the URLs you actually opened.
+- Search; never answer from memory. If nothing usable comes back, say so.
+- Run several differently-phrased queries, and open the primary source rather
+  than a summary of it.
+- Cite every claim with a full URL and the page's date.
+- Separate what sources state from what you infer, and surface disagreement
+  between them instead of averaging it away.
+- Close with a "Sources" list of the URLs you opened.
 """
 
 RESEARCH_RULES = (
     WEB_RULES
     + """
-This is a deep-research turn, so go wider than a single search pass:
+Go wider than one search pass:
 
-1. Decompose the topic into the distinct sub-questions that must each be answered
-   before the whole can be. State them before you search.
-2. Work each sub-question separately, with several differently-phrased queries.
-   Use X search alongside web search when practitioner reaction, first-hand
-   accounts, or very recent developments are relevant.
-3. Cross-check every load-bearing claim against a second independent source. Say
-   which claims you could confirm twice and which rest on one source.
-4. Actively look for evidence that contradicts your emerging answer before you
-   settle on it.
-5. Structure the report as: answer up front, then per sub-question findings, then
-   an explicit "Uncertain / unresolved" section, then Sources.
-
-Do not run a background workflow or hand the work to a subagent — research and
-report within this turn.
+- State the sub-questions the topic breaks into, then work each one.
+- Cross-check load-bearing claims against a second independent source, and say
+  which ones rest on only one.
+- Look for evidence contradicting your emerging answer before settling on it.
+- Structure: answer, per-question findings, "Uncertain / unresolved", Sources.
+- Do it all in this turn — no background workflow, no subagent.
 """
 )
 
+MEDIA_RULES = """\
+You are a media-generation tool. Produce the asset and report where it landed.
+
+- Expand the brief into a full visual prompt — subject, composition, lighting,
+  colour, style, mood — without changing what was actually asked for.
+- Make exactly one generation call unless variants were requested.
+- Reply with only the tool used, the prompt you sent, and the saved path.
+- If the tool fails, report its error verbatim; never claim a file that isn't there.
+"""
+
 ASK_RULES = """\
-The caller is another AI agent, not a human at a terminal. Answer with the finished
-result, not a plan or a progress narration. Use live search whenever the answer
-depends on current facts, and cite URLs for anything you retrieved. State plainly
-when something could not be verified.
+You are answering another agent, not a person. Give the finished result, not a plan
+or a progress narration. Use live search whenever the answer depends on current
+facts and cite URLs for what you retrieved. Say plainly what you could not verify.
 """
 
 MODE_HINT = {
-    "latest": 'Order by recency: prefer mode "Latest" and sort the report newest-first.',
-    "top": 'Order by reach: prefer mode "Top" and sort the report by engagement.',
+    "latest": 'Rank by recency (mode "Latest"), newest first.',
+    "top": 'Rank by engagement (mode "Top").',
 }
 
 
@@ -490,12 +549,9 @@ def build_prompt(cmd: str, subject: str, args: argparse.Namespace) -> tuple[str,
     """Return (rules, prompt_text) for a command."""
     directives: list[str] = []
     if args.since or args.until:
-        window = []
-        if args.since:
-            window.append(f"since:{args.since}")
-        if args.until:
-            window.append(f"until:{args.until}")
-        directives.append(f"Restrict results to {' '.join(window)} and put these operators in the query itself.")
+        window = " ".join(f"{k}:{v}" for k, v in (("since", args.since), ("until", args.until)) if v)
+        # The wire-level dateBound is unreliable; the in-query operators are what bite.
+        directives.append(f"Put {window} in the query itself.")
     if getattr(args, "sort", None):
         directives.append(MODE_HINT[args.sort])
     if getattr(args, "limit", None):
@@ -510,23 +566,37 @@ def build_prompt(cmd: str, subject: str, args: argparse.Namespace) -> tuple[str,
         return X_RULES, f"Search X (Twitter) and answer this request:\n\n<request>\n{subject}\n</request>{tail}"
     if cmd == "user":
         return X_RULES, (
-            f"Identify the X account(s) matching: <request>\n{subject}\n</request>\n\n"
-            "Use x_user_search first. For each account report handle, display name, bio, "
-            "follower count, verified status, join date, location and website when the tool "
-            "returns them, plus the profile URL. Then use x_keyword_search with `from:<handle>` "
-            "to show that account's recent activity. If several accounts could match, list the "
-            "candidates and say which one fits and why — do not silently pick one." + tail
+            f"Identify the X account(s) matching:\n\n<request>\n{subject}\n</request>\n\n"
+            "Report each candidate's profile fields and URL, then its recent activity via "
+            "`from:<handle>`. If several could match, list them and say which fits and why — "
+            "do not silently pick one." + tail
         )
     if cmd == "thread":
         pid = extract_post_id(subject)
         target = f"post_id {pid}" if pid else f"the post at {subject}"
         return X_RULES, (
-            f"Use x_thread_fetch on {target} and report the full thread.\n\n"
-            "Give the root post's author, date, permalink and complete text; then every post in "
-            "the thread in order; then the notable replies and quote-posts with their authors and "
-            "permalinks. If the post quotes or replies to another post, fetch that one too so the "
-            "context is complete. Reproduce the text — do not paraphrase it away." + tail
+            f"Fetch {target} and report the whole thread: the root post, then every post in "
+            "order, then notable replies and quote-posts — each with author, date, permalink, "
+            "and its text reproduced rather than paraphrased. Fetch anything it quotes or "
+            "replies to as well." + tail
         )
+    if cmd in ("image", "edit", "video"):
+        specs: list[str] = []
+        if getattr(args, "aspect", None):
+            specs.append(f"aspect_ratio: {args.aspect}")
+        for path in getattr(args, "image", None) or []:
+            specs.append(f"input image: {path}")
+        if getattr(args, "duration", None):
+            specs.append(f"duration: {args.duration} seconds")
+        if getattr(args, "resolution", None):
+            specs.append(f"resolution_name: {args.resolution}")
+        spec_block = ("\n\nExact tool arguments to use:\n" + "\n".join(f"- {s}" for s in specs)) if specs else ""
+        verb = {
+            "image": "Generate an image with `image_gen`",
+            "edit": "Edit the given image(s) with `image_edit`",
+            "video": "Generate a video with `image_to_video` (one input image) or `reference_to_video` (two or more)",
+        }[cmd]
+        return MEDIA_RULES, f"{verb} from this brief:\n\n<brief>\n{subject}\n</brief>{spec_block}{tail}"
     if cmd == "web":
         return WEB_RULES, f"Research this on the live web and answer:\n\n<request>\n{subject}\n</request>{tail}"
     if cmd == "research":
@@ -563,6 +633,62 @@ def load_schema(spec: str) -> dict[str, Any]:
     if not isinstance(schema, dict):
         die("--schema must be a JSON object describing a JSON Schema")
     return schema
+
+
+def retrieve_media(media: list[dict[str, Any]], out_spec: str) -> list[dict[str, Any]]:
+    """Copy generated files out of Grok's session folder into somewhere usable.
+
+    Grok saves media under ~/.grok/sessions/<url-encoded-cwd>/<session-id>/, which
+    is not a path a caller can reasonably be handed. Returns the media list with a
+    `saved` key added.
+    """
+    out = Path(out_spec).expanduser()
+    named_file = len(media) == 1 and out.suffix and not out.is_dir()
+    target_dir = out.parent if named_file else out
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        die(f"--out: cannot create {target_dir}: {e}")
+
+    for item in media:
+        src = item.get("path") or ""
+        if not src:
+            continue  # uploaded_url only (ZDR video output) — nothing local to copy
+        src_p = Path(src)
+        if not src_p.is_file():
+            item["error"] = f"generated file missing at {src}"
+            continue
+        if named_file:
+            dest = out
+        else:
+            stem = MEDIA_STEM.get(item["kind"], "grok-media")
+            ext = src_p.suffix or MEDIA_EXT.get(item["kind"], "")
+            dest = target_dir / f"{stem}{ext}"
+            n = 2
+            while dest.exists():
+                dest = target_dir / f"{stem}-{n}{ext}"
+                n += 1
+        try:
+            shutil.copy2(src_p, dest)
+            item["saved"] = str(dest.resolve())
+        except OSError as e:
+            item["error"] = f"could not copy to {dest}: {e}"
+    return media
+
+
+class ThoughtPrinter:
+    """Buffer the reasoning stream and emit it a line at a time, truncated."""
+
+    def __init__(self, out: Any, width: int = 100) -> None:
+        self.out, self.width, self.buf = out, width, ""
+
+    def __call__(self, chunk: str) -> None:
+        self.buf += chunk
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            line = line.strip()
+            if line:
+                print(f"  ~ {line[: self.width]}", file=self.out, flush=True)
 
 
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -624,8 +750,10 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     if getattr(args, "workspace", False) and not args.cwd:
         die("ask --workspace needs --cwd DIR — the directory you are handing Grok")
+    is_media = args.command in ("image", "edit", "video")
     quiet = args.json or args.quiet
-    timeout = args.timeout if args.timeout is not None else (900 if args.command == "research" else DEFAULT_TIMEOUT)
+    default_timeout = 900 if args.command == "research" else MEDIA_TIMEOUT if is_media else DEFAULT_TIMEOUT
+    timeout = args.timeout if args.timeout is not None else default_timeout
     started = time.monotonic()
 
     def progress(msg: str) -> None:
@@ -635,6 +763,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     workspace = args.cwd or scratch_dir()
     # The search-only profile also blocks subagent spawning (a non-empty `tools`
     # allowlist with no Agent directive), which keeps `research` synchronous.
+    # Media commands keep the full toolset: Grok loads its own `imagine` skill
+    # (via read_file) to write better prompts, which an allowlist would break.
     restricted = args.command in ("x", "user", "thread", "web", "research") or (args.command == "ask" and not args.workspace)
     rules, text = build_prompt(args.command, subject, args)
     if args.rules:
@@ -653,6 +783,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     if schema:
         prompt_meta["outputSchema"] = schema
 
+    # Stream the answer as it arrives. Not under --json (it would corrupt the
+    # object) and not under --schema (the payload is only usable once complete).
+    stream_out = None if (args.json or schema or args.no_stream) else sys.stdout
+    thoughts = ThoughtPrinter(sys.stderr) if (args.thinking and not quiet) else None
+
     if not quiet:
         print(f"[grok] {args.command} · workspace {workspace}", file=sys.stderr, flush=True)
 
@@ -661,6 +796,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             cwd=workspace,
             model=args.model,
             effort=args.effort,
+            leader=args.leader,
             raw_log=args.raw_log,
             on_progress=progress,
         ) as agent:
@@ -676,7 +812,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     ) from None
             else:
                 agent.new_session(meta=session_meta)
-            result = agent.prompt(text, meta=prompt_meta, timeout=timeout)
+            result = agent.prompt(text, meta=prompt_meta, timeout=timeout, stream=stream_out, on_thought=thoughts)
             session_id = agent.session_id
     except AcpError as e:
         msg = str(e)
@@ -690,6 +826,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     elapsed = time.monotonic() - started
     answer = result["answer"]
+    media = retrieve_media(result["media"], args.out) if result["media"] else []
     structured = None
     if schema:
         for seg in reversed(result["segments"]):
@@ -709,6 +846,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "query": subject,
                     "answer": answer,
                     "structured": structured,
+                    "media": media,
                     "queries": result["queries"],
                     "tool_calls": result["tool_calls"],
                     "session_id": session_id,
@@ -723,7 +861,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
         return 0
 
-    print(answer)
+    if stream_out is None:
+        print(answer)
+
+    failed_media = False
+    for item in media:
+        if item.get("saved"):
+            print(f"\n{item['kind']} → {item['saved']}")
+        elif item.get("uploaded_url"):
+            print(f"\n{item['kind']} → {item['uploaded_url']}  (remote only, not saved locally)")
+        else:
+            failed_media = True
+            print(f"\n{item['kind']} → FAILED: {item.get('error', 'unknown')}", file=sys.stderr)
+
     if not quiet:
         usage = (result["meta"] or {}).get("usage") or {}
         print(
@@ -737,7 +887,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("[grok] queries run:", file=sys.stderr)
             for q in result["queries"]:
                 print(f"         {q}", file=sys.stderr)
-    if result["stop_reason"] not in (None, "end_turn"):
+    if failed_media or result["stop_reason"] not in (None, "end_turn"):
+        return 1
+    if is_media and not media:
+        print("error: no media was generated — see the answer above for why", file=sys.stderr)
         return 1
     return 0
 
@@ -759,10 +912,12 @@ examples:
   grok_acp.py check
   grok_acp.py x "what are people saying about the new Claude model this week"
   grok_acp.py x "from:sama posts about AGI" --since 2026-01-01 --sort top
+  grok_acp.py x "sentiment on $NVDA earnings" --json
   grok_acp.py user "the person who created Rust"
   grok_acp.py thread https://x.com/elonmusk/status/2080706813662482472
   grok_acp.py web "current status of the EU AI Act implementation timeline"
-  grok_acp.py x "sentiment on $NVDA earnings" --json
+  grok_acp.py image "flat vector origami crane, dark bg" --aspect 1:1 --out ./assets
+  grok_acp.py edit "make it gold, keep composition" --image "$PWD/assets/grok-image.jpg"
 """
 
 
@@ -793,6 +948,10 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--effort", choices=["low", "medium", "high"], help="reasoning effort")
         sp.add_argument("--timeout", type=float, default=None, metavar="SEC", help=f"per-turn timeout (default {DEFAULT_TIMEOUT}, 900 for research)")
         sp.add_argument("--quiet", action="store_true", help="suppress the stderr progress trace")
+        sp.add_argument("--no-stream", action="store_true", help="wait for the full answer instead of streaming it")
+        sp.add_argument("--thinking", action="store_true", help="show Grok's reasoning stream on stderr as it arrives")
+        sp.add_argument("--leader", action="store_true", help="reuse a shared resident agent (faster repeat calls, leaves a daemon running)")
+        sp.add_argument("--out", metavar="DIR|FILE", default=".", help="where to save generated media (default: current dir)")
         sp.add_argument("--raw-log", metavar="FILE", help="dump the full JSON-RPC transcript here")
         sp.add_argument("--no-restrict", action="store_true", help="give Grok its full toolset instead of search-only")
         sp.set_defaults(func=cmd_run, workspace=False)
@@ -801,7 +960,24 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sub.add_parser("user", help="find an X account and profile it"), x_flags=True)
     add_common(sub.add_parser("thread", help="fetch a post + its full thread and replies"), x_flags=True)
     add_common(sub.add_parser("web", help="live web search with citations"), x_flags=False)
-    add_common(sub.add_parser("research", help="deep research: parallel agents, cross-checked, cited report"), x_flags=False)
+    add_common(sub.add_parser("research", help="multi-round research: sub-questions, cross-checked claims, cited report"), x_flags=False)
+
+    img = sub.add_parser("image", help="generate an image from a text prompt (xAI Imagine)")
+    add_common(img, x_flags=False)
+    img.add_argument("--aspect", metavar="RATIO", help="1:1, 16:9, 9:16, 3:2, 2:3, 4:3, 3:4, 2:1, 1:2, auto")
+
+    ed = sub.add_parser("edit", help="edit/restyle/remix an existing image")
+    add_common(ed, x_flags=False)
+    ed.add_argument("--image", action="append", required=True, metavar="PATH", help="source image (absolute path or data: URL); repeat for multi-image edits")
+    ed.add_argument("--aspect", metavar="RATIO", help="output aspect ratio (ignored for single-image edits)")
+
+    vid = sub.add_parser("video", help="animate an image, or blend 2-7 references, into a video")
+    add_common(vid, x_flags=False)
+    vid.add_argument("--image", action="append", required=True, metavar="PATH", help="source image; repeat (2-7) for reference_to_video")
+    vid.add_argument("--aspect", metavar="RATIO", help="output aspect ratio")
+    vid.add_argument("--duration", type=int, metavar="SEC", help="video length in seconds")
+    vid.add_argument("--resolution", metavar="NAME", help="resolution_name, e.g. 480p or 720p")
+
     ask = sub.add_parser("ask", help="free-form prompt; Grok picks its own tools")
     add_common(ask, x_flags=True)
     ask.add_argument("--workspace", action="store_true", help="run in --cwd with Grok's full toolset (it can then read/write files there)")
@@ -813,7 +989,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    for name in ("since", "until", "sort", "lang", "limit", "reply_lang"):
+    for name in ("since", "until", "sort", "lang", "limit", "reply_lang", "aspect", "image", "duration", "resolution"):
         if not hasattr(args, name):
             setattr(args, name, None)
     try:
