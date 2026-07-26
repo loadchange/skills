@@ -6,6 +6,9 @@ This is my personal Claude Skills marketplace, forked from [Anthropic's official
 
 ## Current Skills
 
+### grok
+Delegate live X (Twitter) and web research to the locally-installed [Grok Build](https://docs.x.ai/build/overview) agent over ACP — search posts, find accounts, read threads and replies, track sentiment, or get current facts, returned as a cited report. Works from any agent tool that can run a shell command.
+
 ### polymarket-wallet
 Polymarket wallet trading analysis and report generation — look up a trader by wallet address or display name to get positions, P&L, and win rate.
 
