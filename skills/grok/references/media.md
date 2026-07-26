@@ -104,29 +104,48 @@ python3 $S image "app icon, rounded square, teal gradient" --aspect 1:1 --json
 
 ## Known limits
 
-- **Video fails on Zero Data Retention accounts.** The API rejects it with:
+- **Video on Zero Data Retention (ZDR) teams.** ZDR is a **team** flag (personal
+  SuperGrok can still be ZDR). It is **not** the same as `/privacy` /
+  `coding_data_retention_opt_out`. Under ZDR the video API will not host the
+  file; it needs `output.upload_url`. Without a working local upload target you
+  get:
 
   ```
   HTTP 400: {"code":"invalid-argument",
    "error":"Zero Data Retention teams must provide output.upload_url for video generation."}
   ```
 
-  ZDR accounts cannot have video stored server-side, so the output must go to a
-  presigned URL you own. Fix it in `~/.grok/config.toml`:
+  Configure a writable S3-compatible bucket in `~/.grok/config.toml` (mode `0600`).
+  Prefer **nested** credential tables and a real region (R2: `us-east-1`, not
+  `auto`). Incomplete config is ignored with
+  `tools.zdr_video_output_s3 is present but incomplete`:
 
   ```toml
   [tools.zdr_video_output_s3]
   bucket = "your-bucket"
   endpoint = "https://s3.example.com"
   region = "us-east-1"
-  # key_prefix = "grok-videos/"   # default
-  # expires_secs = 900            # default
-  read_write = { access_key_id = "...", secret_access_key = "..." }
+  key_prefix = "grok-videos/"
+  expires_secs = 900
+
+  [tools.zdr_video_output_s3.read_write]
+  access_key_id = "..."
+  secret_access_key = "..."
+
+  # Optional; GET falls back to read_write if omitted.
+  [tools.zdr_video_output_s3.read_only]
+  access_key_id = "..."
+  secret_access_key = "..."
   ```
 
-  Image generation is unaffected. When video does route through S3, the result
-  comes back as `uploaded_url` with no local file — the script prints the URL and
-  says it was not saved locally.
+  Image generation is unaffected. When video succeeds via S3, Grok often returns
+  only `uploaded_url` (no session path). **This skill downloads that URL into
+  `--out`** as `grok-video.mp4` when the URL is fetchable; if download fails it
+  prints the URL and exits non-zero.
+
+  Note: some Grok Build CLI builds still fail to inject `upload_url` even with a
+  valid config (tool returns the same 400). Then fix/upgrade the CLI, or disable
+  ZDR on the team in [console.x.ai](https://console.x.ai/) if you can.
 - **One call per run.** The rules tell Grok to make exactly one generation call
   unless you ask for variants, so a run costs one image. Ask for "three variants"
   explicitly if you want more.

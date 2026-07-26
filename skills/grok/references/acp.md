@@ -162,7 +162,8 @@ real artifact:
 
 `type` is one of `ImageGen` / `ImageEdit` / `ImageToVideo` / `ReferenceToVideo`.
 `uploaded_url` replaces `path` when the file went to a presigned URL instead of
-disk (ZDR video output). See `references/media.md`.
+disk (ZDR video output). The skill downloads a fetchable `uploaded_url` into
+`--out` when possible. See `references/media.md`.
 
 ## Agent → client requests
 

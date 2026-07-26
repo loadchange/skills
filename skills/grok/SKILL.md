@@ -136,7 +136,7 @@ approvals auto-accepted. Only pass a directory the user agreed to hand over.
 
 - `references/x-search.md` — the four `x_search` sub-tools, X operator reference,
   recipes, limits. **Read when a search underperforms.**
-- `references/media.md` — image/video tools, aspect ratios, where files land, the
-  ZDR video limitation.
+- `references/media.md` — image/video tools, aspect ratios, where files land, ZDR
+  video config (nested S3 tables), and remote `uploaded_url` download.
 - `references/acp.md` — ACP wire protocol and `_meta` options, for driving
   `grok agent stdio` directly.

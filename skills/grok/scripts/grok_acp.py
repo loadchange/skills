@@ -635,12 +635,40 @@ def load_schema(spec: str) -> dict[str, Any]:
     return schema
 
 
+def _media_dest(item: dict[str, Any], out: Path, named_file: bool, target_dir: Path, preferred_ext: str = "") -> Path:
+    """Pick a non-colliding destination path under --out for one media item."""
+    if named_file:
+        return out
+    stem = MEDIA_STEM.get(item["kind"], "grok-media")
+    ext = preferred_ext or MEDIA_EXT.get(item["kind"], "")
+    dest = target_dir / f"{stem}{ext}"
+    n = 2
+    while dest.exists():
+        dest = target_dir / f"{stem}-{n}{ext}"
+        n += 1
+    return dest
+
+
+def _download_url(url: str, dest: Path, timeout: float = 120.0) -> None:
+    """Download a remote media URL (e.g. ZDR presigned GET) to dest."""
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    if not data:
+        raise OSError("empty response body")
+    dest.write_bytes(data)
+
+
 def retrieve_media(media: list[dict[str, Any]], out_spec: str) -> list[dict[str, Any]]:
     """Copy generated files out of Grok's session folder into somewhere usable.
 
     Grok saves media under ~/.grok/sessions/<url-encoded-cwd>/<session-id>/, which
-    is not a path a caller can reasonably be handed. Returns the media list with a
-    `saved` key added.
+    is not a path a caller can reasonably be handed. ZDR video often returns only
+    `uploaded_url` (no local path); those are downloaded into --out when possible.
+    Returns the media list with a `saved` key added.
     """
     out = Path(out_spec).expanduser()
     named_file = len(media) == 1 and out.suffix and not out.is_dir()
@@ -652,27 +680,30 @@ def retrieve_media(media: list[dict[str, Any]], out_spec: str) -> list[dict[str,
 
     for item in media:
         src = item.get("path") or ""
-        if not src:
-            continue  # uploaded_url only (ZDR video output) — nothing local to copy
-        src_p = Path(src)
-        if not src_p.is_file():
-            item["error"] = f"generated file missing at {src}"
+        if src:
+            src_p = Path(src)
+            if not src_p.is_file():
+                item["error"] = f"generated file missing at {src}"
+                continue
+            dest = _media_dest(item, out, named_file, target_dir, preferred_ext=src_p.suffix)
+            try:
+                shutil.copy2(src_p, dest)
+                item["saved"] = str(dest.resolve())
+            except OSError as e:
+                item["error"] = f"could not copy to {dest}: {e}"
             continue
-        if named_file:
-            dest = out
-        else:
-            stem = MEDIA_STEM.get(item["kind"], "grok-media")
-            ext = src_p.suffix or MEDIA_EXT.get(item["kind"], "")
-            dest = target_dir / f"{stem}{ext}"
-            n = 2
-            while dest.exists():
-                dest = target_dir / f"{stem}-{n}{ext}"
-                n += 1
-        try:
-            shutil.copy2(src_p, dest)
-            item["saved"] = str(dest.resolve())
-        except OSError as e:
-            item["error"] = f"could not copy to {dest}: {e}"
+
+        # ZDR video path: tool may only return a presigned uploaded_url.
+        url = (item.get("uploaded_url") or "").strip()
+        if url.startswith("http://") or url.startswith("https://"):
+            dest = _media_dest(item, out, named_file, target_dir)
+            try:
+                _download_url(url, dest)
+                item["saved"] = str(dest.resolve())
+            except Exception as e:  # noqa: BLE001 — surface any download failure
+                item["error"] = f"could not download uploaded_url to {dest}: {e}"
+            continue
+        # Neither a local path nor a fetchable URL.
     return media
 
 
@@ -869,7 +900,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         if item.get("saved"):
             print(f"\n{item['kind']} → {item['saved']}")
         elif item.get("uploaded_url"):
-            print(f"\n{item['kind']} → {item['uploaded_url']}  (remote only, not saved locally)")
+            # Download failed; still surface the remote URL for manual recovery.
+            print(f"\n{item['kind']} → {item['uploaded_url']}  (remote only; download to --out failed)")
+            if item.get("error"):
+                print(f"  {item['error']}", file=sys.stderr)
+            failed_media = True
         else:
             failed_media = True
             print(f"\n{item['kind']} → FAILED: {item.get('error', 'unknown')}", file=sys.stderr)
