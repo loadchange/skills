@@ -333,6 +333,12 @@ class GrokAgent:
         broke = [False]  # a tool call since the last text chunk => paragraph break
         wrote = [False]
         thought_seen = [False]
+        # How many leading segments Grok emitted before touching a tool — i.e. the
+        # "I'll go look that up" preamble, which verbatim-output modes must drop.
+        # None until the first tool call measures it; 0 is a real answer (no
+        # preamble) and must not be re-measured by a later call, or interleaved
+        # fetch/text/fetch/text turns would count real content as preamble.
+        preamble: list[int | None] = [None]
 
         def flush() -> None:
             if pending:
@@ -370,6 +376,8 @@ class GrokAgent:
                 if on_thought:
                     on_thought((u.get("content") or {}).get("text") or "")
             elif kind in ("tool_call", "tool_call_update"):
+                if not broke[0] and preamble[0] is None:
+                    preamble[0] = len(segments) + (1 if pending else 0)
                 broke[0] = True
                 tid = u.get("toolCallId") or ""
                 entry = tool_calls.setdefault(tid, {"name": None, "title": u.get("title"), "input": None, "status": None})
@@ -422,6 +430,7 @@ class GrokAgent:
             # (including the "still searching…" preambles) is schema-shaped, so the
             # real payload is the last one that parses.
             "segments": segments,
+            "preamble": preamble[0] or 0,
             "tool_calls": calls,
             "queries": _extract_queries(calls),
             "stop_reason": res.get("stopReason"),
@@ -507,6 +516,16 @@ You are a live web research engine answering another agent, not a person.
 - Separate what sources state from what you infer, and surface disagreement
   between them instead of averaging it away.
 - Close with a "Sources" list of the URLs you opened.
+"""
+
+FETCH_RULES = """\
+You are a URL-to-markdown converter, not a summarizer.
+
+- web_fetch each URL and output the page content as markdown, verbatim.
+- No preamble, no summary, no commentary, no reordering. Content only.
+- Keep headings, lists, tables, code blocks, and link targets intact.
+- Prefix each page with `# <url>` when several were requested.
+- If a fetch fails, report that URL's error and nothing else for it.
 """
 
 RESEARCH_RULES = (
@@ -597,6 +616,10 @@ def build_prompt(cmd: str, subject: str, args: argparse.Namespace) -> tuple[str,
             "video": "Generate a video with `image_to_video` (one input image) or `reference_to_video` (two or more)",
         }[cmd]
         return MEDIA_RULES, f"{verb} from this brief:\n\n<brief>\n{subject}\n</brief>{spec_block}{tail}"
+    if cmd == "fetch":
+        urls = subject.split()
+        listing = "\n".join(f"- {u}" for u in urls)
+        return FETCH_RULES, f"Fetch and return as markdown:\n{listing}{tail}"
     if cmd == "web":
         return WEB_RULES, f"Research this on the live web and answer:\n\n<request>\n{subject}\n</request>{tail}"
     if cmd == "research":
@@ -796,7 +819,7 @@ def cmd_run(args: argparse.Namespace) -> int:
     # allowlist with no Agent directive), which keeps `research` synchronous.
     # Media commands keep the full toolset: Grok loads its own `imagine` skill
     # (via read_file) to write better prompts, which an allowlist would break.
-    restricted = args.command in ("x", "user", "thread", "web", "research") or (args.command == "ask" and not args.workspace)
+    restricted = args.command in ("x", "user", "thread", "web", "research", "fetch") or (args.command == "ask" and not args.workspace)
     rules, text = build_prompt(args.command, subject, args)
     if args.rules:
         rules = f"{rules}\n\nAdditional caller instructions:\n{args.rules}"
@@ -815,8 +838,11 @@ def cmd_run(args: argparse.Namespace) -> int:
         prompt_meta["outputSchema"] = schema
 
     # Stream the answer as it arrives. Not under --json (it would corrupt the
-    # object) and not under --schema (the payload is only usable once complete).
-    stream_out = None if (args.json or schema or args.no_stream) else sys.stdout
+    # object), not under --schema (the payload is only usable once complete), and
+    # not for `fetch`, whose output must be the page and nothing else — the
+    # preamble can only be stripped after the fact.
+    verbatim = args.command == "fetch"
+    stream_out = None if (args.json or schema or args.no_stream or verbatim) else sys.stdout
     thoughts = ThoughtPrinter(sys.stderr) if (args.thinking and not quiet) else None
 
     if not quiet:
@@ -857,6 +883,16 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     elapsed = time.monotonic() - started
     answer = result["answer"]
+    fetch_failed = False
+    if verbatim:
+        body = result["segments"][result["preamble"] :]
+        if body:  # keep everything if the tool never ran — that text is the error
+            answer = "\n\n".join(body)
+        # `fetch url > page.md` must not land an error message in page.md silently.
+        fetches = [c for c in result["tool_calls"] if c.get("name") == "web_fetch"]
+        # Any failed URL means the output is incomplete, so say so — a partial
+        # page set that exits 0 is exactly the silent-error case this guards.
+        fetch_failed = not fetches or any(c.get("status") == "failed" for c in fetches)
     media = retrieve_media(result["media"], args.out) if result["media"] else []
     structured = None
     if schema:
@@ -922,7 +958,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("[grok] queries run:", file=sys.stderr)
             for q in result["queries"]:
                 print(f"         {q}", file=sys.stderr)
-    if failed_media or result["stop_reason"] not in (None, "end_turn"):
+    if failed_media or fetch_failed or result["stop_reason"] not in (None, "end_turn"):
         return 1
     if is_media and not media:
         print("error: no media was generated — see the answer above for why", file=sys.stderr)
@@ -995,6 +1031,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sub.add_parser("user", help="find an X account and profile it"), x_flags=True)
     add_common(sub.add_parser("thread", help="fetch a post + its full thread and replies"), x_flags=True)
     add_common(sub.add_parser("web", help="live web search with citations"), x_flags=False)
+    add_common(sub.add_parser("fetch", help="fetch URL(s) and return the page as markdown"), x_flags=False)
     add_common(sub.add_parser("research", help="multi-round research: sub-questions, cross-checked claims, cited report"), x_flags=False)
 
     img = sub.add_parser("image", help="generate an image from a text prompt (xAI Imagine)")

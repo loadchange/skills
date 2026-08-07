@@ -151,6 +151,14 @@ the source of truth, and why the skill prints the query trace separately.
 Web search calls use `variant:"WebSearch"` with `rawOutput.action.type` of
 `search` (`.query`, `.sources[].url`), `open_page` (`.url`), or `find`.
 
+`web_fetch` is a plain client-side tool — input `{url}`, output the page rendered
+as markdown. HTTP is upgraded to HTTPS, up to 10 redirects are followed, URLs are
+capped at 2000 chars, long pages are truncated to fit context, and SSRF-unsafe
+targets are refused. Authenticated or private URLs (Google Docs, Confluence, Jira,
+private repos) fail by design. A failed call reports `status: "failed"` on its
+`tool_call_update` — which is how the skill's `fetch` command decides its exit
+code, since Grok narrating an error still ends the turn with `end_turn`.
+
 Media tools (`image_gen`, `image_edit`, `image_to_video`, `reference_to_video`)
 are ordinary client-side tools, so unlike the hosted search tools they return a
 real artifact:
