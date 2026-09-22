@@ -908,7 +908,8 @@ def cmd_remote(args: argparse.Namespace) -> int:
             print(f"error: {code} — {msg}{hint}", file=sys.stderr)
         return 1
 
-    posts = data.get("posts") or []
+    # search/followup return `posts`; user returns `recentPosts`; thread returns `thread` + `replies`.
+    posts = data.get("posts") or data.get("recentPosts") or ((data.get("thread") or []) + (data.get("replies") or []))
     if args.json:
         print(json.dumps({
             "ok": True,
