@@ -40,7 +40,7 @@ python3 $S x "from:sama posts about compute" --since 2026-06-01 --sort top
 python3 $S x "reactions to the Figma IPO" --handle bloomberg --handle reuters --raw
 python3 $S user karpathy
 python3 $S thread https://x.com/karpathy/status/2081195664479068350 --json
-python3 $S ask https://x.com/someone/status/2102324523240726612 这个帖子什么意思？
+python3 $S ask https://x.com/someone/status/1234567890123456789 这个帖子什么意思？
 python3 $S x "zed editor reactions" --ask "what are the main complaints?"
 ```
 
