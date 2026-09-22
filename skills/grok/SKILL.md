@@ -25,8 +25,9 @@ your own machine — same commands, same flags, same output, plus structured `po
 in `--json`. Configure one of:
 
 ```bash
-export X_SEARCH_SSH=polysnipe-tencent-jp        # curl runs on that host against its loopback port; nothing exposed
-export X_SEARCH_URL=http://127.0.0.1:31890      # direct HTTP, e.g. behind `ssh -L 31890:127.0.0.1:31890 <host>`
+export X_SEARCH_URL=https://x-search.example.com     # the public HTTPS endpoint (Cloudflare Tunnel in front of the plugin)
+export X_SEARCH_TOKEN=$(cat ~/.config/x-search/token) # its bearer token (keep it in a 0600 file, not in shell history)
+# or, from a machine that can ssh to the host: export X_SEARCH_SSH=<ssh alias>   (loopback, no token needed)
 ```
 
 With either set, X commands go there automatically (`--backend grok|remote|auto`
