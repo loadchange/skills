@@ -7,7 +7,7 @@ This is my personal Claude Skills marketplace, forked from [Anthropic's official
 ## Current Skills
 
 ### dsh-x
-Search X (Twitter) through your own [dsh-x-search](https://github.com/loadchange/dsh-x-search) endpoint — posts, sentiment, an account and its recent posts, a post's full thread — as a cited report with structured posts. Config in `~/.config/dsh-x/config.json`; no Grok subscription.
+Search X (Twitter) through your own [dsh-x-search](https://github.com/loadchange/dsh-x-search) endpoint. The skill lives in that repo next to the server (`skills/dsh-x`); this marketplace lists it as a plugin sourced from there: `claude plugin install dsh-x@loadchange-skills`.
 
 ### grok
 Delegate live X (Twitter) and web research to the locally-installed [Grok Build](https://docs.x.ai/build/overview) agent over ACP — search posts, find accounts, read threads and replies, track sentiment, or get current facts, returned as a cited report. Works from any agent tool that can run a shell command.

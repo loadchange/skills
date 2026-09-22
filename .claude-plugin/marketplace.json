@@ -6,7 +6,7 @@
   },
   "metadata": {
     "description": "LoadChange's personal skills marketplace",
-    "version": "1.0.10"
+    "version": "1.0.11"
   },
   "plugins": [
     {
@@ -19,9 +19,16 @@
         "./skills/hyperliquid-analytics",
         "./skills/drawio-diagram",
         "./skills/guodegang",
-        "./skills/grok",
-        "./skills/dsh-x"
+        "./skills/grok"
       ]
+    },
+    {
+      "name": "dsh-x",
+      "description": "Search X (Twitter) through your own dsh-x-search endpoint. Lives in the dsh-x-search repo (server + client together).",
+      "source": {
+        "source": "github",
+        "repo": "loadchange/dsh-x-search"
+      }
     }
   ]
 }
