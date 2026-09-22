@@ -15,11 +15,14 @@ import json
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -37,8 +40,8 @@ MEDIA_EXT = {"ImageGen": ".jpg", "ImageEdit": ".jpg", "ImageToVideo": ".mp4", "R
 MEDIA_STEM = {"ImageGen": "grok-image", "ImageEdit": "grok-edit", "ImageToVideo": "grok-video", "ReferenceToVideo": "grok-video"}
 
 
-def find_grok() -> str:
-    """Resolve the grok binary: $GROK_BIN, then PATH, then the default install."""
+def locate_grok() -> str | None:
+    """The grok binary if installed: $GROK_BIN, then PATH, then the default install; else None."""
     explicit = os.environ.get("GROK_BIN")
     if explicit:
         if os.path.isfile(explicit) and os.access(explicit, os.X_OK):
@@ -50,12 +53,21 @@ def find_grok() -> str:
     fallback = Path.home() / ".grok" / "bin" / "grok"
     if fallback.is_file() and os.access(fallback, os.X_OK):
         return str(fallback)
+    return None
+
+
+def find_grok() -> str:
+    """Resolve the grok binary or exit with install instructions."""
+    found = locate_grok()
+    if found:
+        return found
     die(
         "grok CLI not found.\n"
         "  Install:  curl -fsSL https://x.ai/cli/install.sh | bash\n"
         "  Then:     grok login\n"
         "  Or set GROK_BIN=/path/to/grok"
     )
+    return ""
 
 
 def die(msg: str, code: int = 2) -> None:
@@ -762,12 +774,214 @@ def date_bound(args: argparse.Namespace) -> dict[str, Any] | None:
 
 
 # --------------------------------------------------------------------------- #
+# Self-hosted backend: dsh-x-search on your own machine
+# --------------------------------------------------------------------------- #
+#
+# The X commands (x / user / thread) can be served by a dsh-x-search instance
+# instead of Grok Build — same CLI, same flags, same output shape, no SuperGrok
+# subscription. Configure one of:
+#
+#   X_SEARCH_SSH=<ssh host alias>   # run curl on that host against its loopback port (no port exposed)
+#   X_SEARCH_URL=http://127.0.0.1:31890   # direct HTTP (e.g. through `ssh -L`)
+#   X_SEARCH_PORT=31890             # loopback port used in ssh mode (default 31890)
+#
+# `--backend grok|remote|auto` overrides; auto = remote when configured and the
+# command is an X command, grok otherwise. Media, web, fetch and research always
+# use Grok. Schema-constrained output (--schema) is grok-only.
+
+REMOTE_COMMANDS = {"x", "user", "thread"}
+
+
+def remote_target() -> dict[str, str] | None:
+    ssh = os.environ.get("X_SEARCH_SSH", "").strip()
+    url = os.environ.get("X_SEARCH_URL", "").strip()
+    port = os.environ.get("X_SEARCH_PORT", "31890").strip() or "31890"
+    if ssh:
+        return {"kind": "ssh", "host": ssh, "url": f"http://127.0.0.1:{port}"}
+    if url:
+        return {"kind": "http", "url": url.rstrip("/")}
+    return None
+
+
+def choose_backend(args: argparse.Namespace) -> str:
+    """'remote' or 'grok' for this invocation."""
+    wanted = getattr(args, "backend", "auto") or "auto"
+    configured = remote_target() is not None
+    if wanted == "remote":
+        if not configured:
+            die("--backend remote needs X_SEARCH_SSH or X_SEARCH_URL")
+        if args.command not in REMOTE_COMMANDS:
+            die(f"the self-hosted backend only serves {sorted(REMOTE_COMMANDS)}; `{args.command}` needs Grok")
+        return "remote"
+    if wanted == "grok":
+        return "grok"
+    return "remote" if configured and args.command in REMOTE_COMMANDS and not getattr(args, "schema", None) else "grok"
+
+
+def remote_call(target: dict[str, str], path: str, payload: dict[str, Any] | None, timeout: float) -> tuple[int, dict[str, Any]]:
+    """POST `payload` (or GET when None) to the backend; returns (status, json)."""
+    body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if target["kind"] == "http":
+        req = urllib.request.Request(target["url"] + path, data=body, method="GET" if body is None else "POST",
+                                     headers={} if body is None else {"content-type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read().decode("utf-8") or "{}")
+            except json.JSONDecodeError:
+                return e.code, {"ok": False, "code": "INTERNAL", "message": f"HTTP {e.code}"}
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            raise AcpError(f"cannot reach {target['url']}: {e}") from None
+    # ssh mode: the request body travels on stdin; curl runs on the remote host against loopback.
+    url = target["url"] + path
+    curl = f"curl -s -m {int(timeout)} -w '\\n%{{http_code}}' " + ("" if body is None else "-H content-type:application/json --data-binary @- ") + shlex.quote(url)
+    try:
+        proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", target["host"], curl],
+                              input=body, capture_output=True, timeout=timeout + 30)
+    except subprocess.TimeoutExpired:
+        raise AcpError(f"ssh to {target['host']} timed out after {timeout + 30:.0f}s") from None
+    out = proc.stdout.decode("utf-8", errors="replace")
+    text, _, code = out.rpartition("\n")
+    if not code.strip().isdigit():
+        err = proc.stderr.decode("utf-8", errors="replace").strip()[-400:]
+        raise AcpError(f"ssh/curl to {target['host']} failed (exit {proc.returncode}): {err or 'no output'}")
+    try:
+        return int(code), json.loads(text or "{}")
+    except json.JSONDecodeError:
+        return int(code), {"ok": False, "code": "INTERNAL", "message": f"non-JSON response (HTTP {code})"}
+
+
+def cmd_remote(args: argparse.Namespace) -> int:
+    """Serve an X command from dsh-x-search. Output contract matches the Grok path."""
+    target = remote_target()
+    assert target is not None
+    subject = " ".join(args.query).strip()
+    if not subject:
+        die("empty query")
+    if getattr(args, "schema", None):
+        die("--schema is grok-only; drop it or pass --backend grok")
+    quiet = args.json or args.quiet
+    timeout = args.timeout if args.timeout is not None else DEFAULT_TIMEOUT
+    started = time.monotonic()
+
+    def opt(name: str) -> Any:
+        return getattr(args, name, None)
+
+    common = {k: v for k, v in {"replyLang": opt("reply_lang"), "raw": True if opt("raw") else None}.items() if v is not None}
+    if args.command == "x" and opt("session"):
+        path, payload = "/api/followup", {"sessionId": args.session, "request": subject, **common}
+    elif args.command == "x":
+        extra = {"since": opt("since"), "until": opt("until"), "sort": opt("sort"), "lang": opt("lang"),
+                 "limit": opt("limit"), "rules": opt("rules")}
+        path, payload = "/api/search", {"request": subject, **{k: v for k, v in extra.items() if v is not None}, **common}
+    elif args.command == "user":
+        path, payload = "/api/user", {"request": subject, **common}
+    else:
+        path, payload = "/api/thread", {"post": subject, **common}
+
+    if not quiet:
+        print(f"[x-search] {args.command} · {target['kind']} {target.get('host') or target['url']}", file=sys.stderr, flush=True)
+    try:
+        status, data = remote_call(target, path, payload, timeout)
+    except AcpError as e:
+        if args.json:
+            print(json.dumps({"ok": False, "backend": "x-search", "command": args.command, "query": subject, "error": str(e)}, ensure_ascii=False, indent=2))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 1
+    elapsed = time.monotonic() - started
+
+    if not data.get("ok"):
+        code, msg = data.get("code", "INTERNAL"), data.get("message", f"HTTP {status}")
+        hint = ""
+        if code == "SESSION_EXPIRED":
+            hint = "\nRe-import the X cookies on the server (deploy/README.md in dsh-x-search), then restart x-search.service."
+        elif code == "RATE_LIMITED":
+            hint = f"\nRetry after ~{int(data.get('retryAfterMs', 0) / 1000)}s."
+        elif code == "UPSTREAM_CHANGED":
+            hint = "\nX changed its web response shape; capture a response with scripts/capture.ts and fix the parser."
+        if args.json:
+            print(json.dumps({"ok": False, "backend": "x-search", "command": args.command, "query": subject, "code": code, "error": msg, "http": status}, ensure_ascii=False, indent=2))
+        else:
+            print(f"error: {code} — {msg}{hint}", file=sys.stderr)
+        return 1
+
+    posts = data.get("posts") or []
+    if args.json:
+        print(json.dumps({
+            "ok": True,
+            "backend": "x-search",
+            "command": args.command,
+            "query": subject,
+            "answer": data.get("answer", ""),
+            "structured": None,
+            "media": [],
+            "posts": posts,
+            "profile": data.get("profile"),
+            "candidates": data.get("candidates"),
+            "queries": data.get("queries", []),
+            "warnings": data.get("warnings", []),
+            "planner": data.get("planner"),
+            "report": data.get("report"),
+            "session_id": data.get("sessionId"),
+            "elapsed_sec": round(elapsed, 1),
+            "server_elapsed_sec": round((data.get("elapsedMs") or 0) / 1000, 1),
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    print(data.get("answer", ""))
+    if not quiet:
+        warn = data.get("warnings") or []
+        lim = data.get("limiter") or {}
+        print(f"\n[x-search] {elapsed:.0f}s · {len(posts)} posts · planner={data.get('planner')} report={data.get('report')}"
+              + (f" · quota {lim.get('usedInWindow')}/{lim.get('perWindow')} (15 min), {lim.get('usedToday')}/{lim.get('perDay')} today" if lim else ""),
+              file=sys.stderr)
+        if data.get("sessionId"):
+            print(f"[x-search] follow up with: --session {data['sessionId']}", file=sys.stderr)
+        for w in warn:
+            print(f"[x-search] warning: {w}", file=sys.stderr)
+        if data.get("queries"):
+            print("[x-search] queries run:", file=sys.stderr)
+            for q in data["queries"]:
+                print(f"         {q}", file=sys.stderr)
+    return 0
+
+
+def remote_check() -> None:
+    """Print the self-hosted backend's status, or how to configure one."""
+    target = remote_target()
+    if target is None:
+        print("\nx-search   not configured (set X_SEARCH_SSH=<host> or X_SEARCH_URL=http://… to serve x/user/thread yourself)")
+        return
+    print(f"\nx-search   {target['kind']} {target.get('host') or target['url']}")
+    try:
+        status, data = remote_call(target, "/api/status", None, 30)
+    except AcpError as e:
+        print(f"  unreachable: {e}")
+        return
+    browser = data.get("browser") or {}
+    lim = data.get("limiter") or {}
+    print(f"  http {status} · session {browser.get('session')} · browser {'open' if browser.get('open') else 'closed'}"
+          f" · llm {'available' if (data.get('llm') or {}).get('available') else 'unavailable'}")
+    print(f"  quota {lim.get('usedInWindow')}/{lim.get('perWindow')} per window, {lim.get('usedToday')}/{lim.get('perDay')} today")
+    if browser.get("lastError"):
+        print(f"  last error: {browser['lastError']}")
+
+
+# --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    binary = find_grok()
+    binary = locate_grok()
+    if binary is None:
+        print("binary   grok CLI not installed — media / web / fetch / research unavailable")
+        print("         (install: curl -fsSL https://x.ai/cli/install.sh | bash && grok login)")
+        remote_check()
+        return 0
     print(f"binary   {binary}")
     for label, flags in (("version ", ["--version"]), ("models  ", ["models"])):
         try:
@@ -793,6 +1007,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         agent.new_session(meta={"agentProfile": SEARCH_PROFILE})
         print(f"  session/new    ok ({agent.session_id})")
     print(f"\nworkspace  {scratch_dir()}  (isolated; search runs never see your repo)")
+    remote_check()
     print("ready.")
     return 0
 
@@ -1025,6 +1240,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--out", metavar="DIR|FILE", default=".", help="where to save generated media (default: current dir)")
         sp.add_argument("--raw-log", metavar="FILE", help="dump the full JSON-RPC transcript here")
         sp.add_argument("--no-restrict", action="store_true", help="give Grok its full toolset instead of search-only")
+        sp.add_argument("--backend", choices=["auto", "grok", "remote"], default="auto", help="auto = self-hosted dsh-x-search for x/user/thread when configured, Grok otherwise")
+        sp.add_argument("--raw", action="store_true", help="self-hosted backend: return the raw cited post list instead of a written report")
         sp.set_defaults(func=cmd_run, workspace=False)
 
     add_common(sub.add_parser("x", help="search X/Twitter: posts, users, threads, history"), x_flags=True)
@@ -1061,10 +1278,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    for name in ("since", "until", "sort", "lang", "limit", "reply_lang", "aspect", "image", "duration", "resolution"):
+    for name in ("since", "until", "sort", "lang", "limit", "reply_lang", "aspect", "image", "duration", "resolution", "backend", "raw"):
         if not hasattr(args, name):
             setattr(args, name, None)
     try:
+        if args.command in REMOTE_COMMANDS and choose_backend(args) == "remote":
+            return cmd_remote(args)
         return args.func(args)
     except KeyboardInterrupt:
         print("\ninterrupted", file=sys.stderr)

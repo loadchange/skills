@@ -13,11 +13,26 @@ for live X data, current facts, and images — not for coding.
 ## Setup
 
 ```bash
-python3 <skill-path>/scripts/grok_acp.py check    # binary, auth, model, handshake
+python3 <skill-path>/scripts/grok_acp.py check    # binary, auth, model, handshake, self-hosted backend
 ```
 
 Missing binary or auth: `curl -fsSL https://x.ai/cli/install.sh | bash`, then
 `grok login`. Python 3.9+, stdlib only.
+
+**Self-hosted X backend (no SuperGrok needed for X).** The `x` / `user` / `thread`
+commands can be served by a [dsh-x-search](../../../dsh-x-search) instance running on
+your own machine — same commands, same flags, same output, plus structured `posts`
+in `--json`. Configure one of:
+
+```bash
+export X_SEARCH_SSH=polysnipe-tencent-jp        # curl runs on that host against its loopback port; nothing exposed
+export X_SEARCH_URL=http://127.0.0.1:31890      # direct HTTP, e.g. behind `ssh -L 31890:127.0.0.1:31890 <host>`
+```
+
+With either set, X commands go there automatically (`--backend grok|remote|auto`
+overrides). Media, `web`, `fetch`, `research` and `--schema` always use Grok.
+`--raw` asks the self-hosted backend for the cited post list without a written
+report — useful when the calling agent prefers to synthesize itself.
 
 ## Commands
 
