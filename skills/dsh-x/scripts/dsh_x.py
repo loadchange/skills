@@ -167,8 +167,16 @@ def build_payload(args: argparse.Namespace, subject: str) -> tuple[str, dict[str
         common["replyLang"] = args.reply_lang
     if args.raw:
         common["raw"] = True
+    if args.ask:
+        common["question"] = args.ask
     if args.command == "x" and args.session:
         return "/api/followup", {"sessionId": args.session, "request": subject, **{k: v for k, v in common.items() if k == "replyLang"}}
+    if args.command == "ask":
+        # `ask <url-or-id> <question…>`: answer a question about one post, images included, server-side.
+        parts = subject.split(None, 1)
+        if len(parts) < 2:
+            die("ask needs a post URL/id followed by the question")
+        return "/api/thread", {"post": parts[0], "question": parts[1], **{k: v for k, v in common.items() if k != "question"}}
     if args.command == "x":
         extra = {
             "since": args.since, "until": args.until, "sort": args.sort, "lang": args.lang, "limit": args.limit, "rules": args.rules,
@@ -225,6 +233,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             "profile": data.get("profile"),
             "candidates": data.get("candidates"),
             "focal": data.get("focal"),
+            "original": data.get("original"),
             "queries": data.get("queries", []),
             "warnings": data.get("warnings", []),
             "planner": data.get("planner"),
@@ -236,6 +245,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 0
 
     print(data.get("answer", ""))
+    if data.get("original") and (args.ask or args.command == "ask") and not quiet:
+        print("\n--- 原文（服务端已读图） ---")
+        print(data["original"])
     if not quiet:
         lim = data.get("limiter") or {}
         print(f"\n[dsh-x] {elapsed:.0f}s · {len(posts)} posts · planner={data.get('planner')} report={data.get('report')}"
@@ -260,6 +272,7 @@ EPILOG = """\
 examples:
   dsh_x.py config --url https://x-search.example.com --token <token>
   dsh_x.py check
+  dsh_x.py ask https://x.com/someone/status/123 这个帖子什么意思？        # server reads the images, answers directly
   dsh_x.py x "what are developers saying about the Zed editor this week" --since 2026-09-15 --reply-lang Chinese
   dsh_x.py x "from:sama posts about compute" --since 2026-06-01 --sort top
   dsh_x.py x "reactions to the Figma IPO" --handle bloomberg --handle reuters --raw
@@ -287,6 +300,7 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--no-replies", action="store_true", help="drop replies")
             sp.add_argument("--rules", metavar="TEXT", help="extra instructions for the report writer")
             sp.add_argument("--session", metavar="ID", help="ask a follow-up over a previous search's posts (no new search)")
+        sp.add_argument("--ask", metavar="QUESTION", help="answer this question directly (server reads the posts' images first) instead of writing a report")
         sp.add_argument("--reply-lang", metavar="LANG", help="language to write the report in (e.g. Chinese)")
         sp.add_argument("--raw", action="store_true", help="cited post list only, no written report")
         sp.add_argument("--json", action="store_true", help="one JSON object on stdout (answer, posts, queries, session_id, …)")
@@ -297,6 +311,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(sub.add_parser("x", help="search X: posts, topics, sentiment, an account's history"), search_flags=True)
     add_common(sub.add_parser("user", help="find an X account (handle or description) and read its recent posts"), search_flags=False)
     add_common(sub.add_parser("thread", help="one post's full text plus its thread and replies"), search_flags=False)
+    add_common(sub.add_parser("ask", help="answer a question about one post: `ask <url|id> <question…>` (images read server-side)"), search_flags=False)
 
     chk = sub.add_parser("check", help="verify config and the endpoint's status")
     chk.set_defaults(func=cmd_check)
@@ -312,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    for name in ("since", "until", "sort", "lang", "limit", "handle", "exclude_handle", "no_replies", "rules", "session", "reply_lang", "raw", "json", "timeout", "quiet"):
+    for name in ("since", "until", "sort", "lang", "limit", "handle", "exclude_handle", "no_replies", "rules", "session", "reply_lang", "raw", "json", "timeout", "quiet", "ask"):
         if not hasattr(args, name):
             setattr(args, name, None)
     try:

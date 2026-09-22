@@ -7,9 +7,9 @@ The script is a thin client over this. Everything is JSON; every request except
 |---|---|
 | `GET /healthz` | — (`{ok, session, updatedAt}`; no auth) |
 | `GET /api/status` | — (browser, limiter, model availability, session count) |
-| `POST /api/search` | `{request, since?, until?, sort?, lang?, limit?, allowedHandles?, excludedHandles?, excludeReplies?, replyLang?, rules?, raw?, queries?}` |
-| `POST /api/user` | `{request, replyLang?, raw?}` |
-| `POST /api/thread` | `{post, replyLang?, raw?}` |
+| `POST /api/search` | `{request, since?, until?, sort?, lang?, limit?, allowedHandles?, excludedHandles?, excludeReplies?, replyLang?, rules?, raw?, queries?, question?}` |
+| `POST /api/user` | `{request, replyLang?, raw?, question?}` |
+| `POST /api/thread` | `{post, replyLang?, raw?, question?}` — with `question` the server reads the images and answers directly; the response adds `original` (focal post text + image descriptions) |
 | `POST /api/followup` | `{sessionId, request, replyLang?}` |
 
 Success: `{ok: true, sessionId, answer, posts | recentPosts | thread+replies, queries, planner, report, warnings, elapsedMs, limiter}`.
@@ -35,7 +35,8 @@ A post:
 {"id":"…","url":"https://x.com/<handle>/status/<id>","text":"…","createdAt":"2026-09-22T04:57:00.000Z",
  "author":{"id":"…","handle":"…","name":"…","followers":123,"verified":true},
  "metrics":{"likes":1,"reposts":2,"replies":3,"quotes":4,"bookmarks":5,"views":6},
- "conversationId":"…","inReplyToId":"…","inReplyToHandle":"…","quoted":{…},"repostedBy":{…},"media":["photo"],"links":["https://…"],"lang":"en"}
+ "conversationId":"…","inReplyToId":"…","inReplyToHandle":"…","quoted":{…},"repostedBy":{…},
+ "media":[{"type":"photo","url":"https://pbs.twimg.com/media/….jpg","alt":"…","description":"内容：… 文字：…"}],"links":["https://…"],"lang":"en"}
 ```
 
 Raw `curl`:

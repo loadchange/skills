@@ -29,6 +29,7 @@ python3 <skill-path>/scripts/dsh_x.py check                                     
 | `x "<request>"` | **The main one.** Any X question: posts, topics, sentiment, who said what |
 | `user "<handle or who>"` | Profile + recent posts; a description is resolved through People search |
 | `thread <url\|post_id>` | One post's full text, the author's thread, and the replies |
+| `ask <url\|id> <question…>` | **"What does this post mean?"** — the server reads the post, its thread *and its images*, then answers directly and returns the original text with image descriptions |
 | `x "<question>" --session <id>` | Follow-up over the previous search's posts — no new search, seconds |
 | `check` · `config` | Endpoint status · write/show the config file |
 
@@ -39,6 +40,8 @@ python3 $S x "from:sama posts about compute" --since 2026-06-01 --sort top
 python3 $S x "reactions to the Figma IPO" --handle bloomberg --handle reuters --raw
 python3 $S user karpathy
 python3 $S thread https://x.com/karpathy/status/2081195664479068350 --json
+python3 $S ask https://x.com/someone/status/2102324523240726612 这个帖子什么意思？
+python3 $S x "zed editor reactions" --ask "what are the main complaints?"
 ```
 
 The report goes to stdout; timing, session id, warnings and the exact queries run go
@@ -58,11 +61,19 @@ author, metrics, createdAt…), `queries`, `warnings`, `session_id`.
 | `--no-replies` | Drop replies |
 | `--reply-lang LANG` | Language of the report |
 | `--rules "TEXT"` | Extra instructions for the report writer |
+| `--ask "QUESTION"` | Answer this question directly instead of writing a report; the server reads the posts' images first. On `thread`/`user`/`x` |
 | `--raw` | Cited post list only, no written report (cheaper; good when you synthesize yourself) |
 | `--session ID` | Follow-up on cached posts |
 | `--json` · `--quiet` · `--timeout SEC` | Output and timing controls |
 
 ## Notes
+
+**Understanding happens on the server — do not fetch media yourself.** When the user
+asks what a post means, run `ask <url> <question>` (or `thread <url> --ask "…"`) and
+relay the answer. The server has the login session, the network path to X's image
+CDN and a vision model: it transcribes text inside images and answers with the
+original quoted. Do not try syndication endpoints, image proxies or local downloads;
+the client usually cannot reach X at all.
 
 **Ask in plain language.** The server plans several X queries from the request. A
 request that already contains X operators (`from:`, `min_faves:`, `"exact phrase"`,
