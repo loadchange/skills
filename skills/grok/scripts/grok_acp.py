@@ -781,8 +781,9 @@ def date_bound(args: argparse.Namespace) -> dict[str, Any] | None:
 # instead of Grok Build — same CLI, same flags, same output shape, no SuperGrok
 # subscription. Configure one of:
 #
-#   X_SEARCH_SSH=<ssh host alias>   # run curl on that host against its loopback port (no port exposed)
-#   X_SEARCH_URL=http://127.0.0.1:31890   # direct HTTP (e.g. through `ssh -L`)
+#   X_SEARCH_URL=https://x-search.example.com   # the public HTTPS endpoint (Cloudflare Tunnel in front of the plugin)
+#   X_SEARCH_TOKEN=<bearer token>               # required by the endpoint; sent as Authorization: Bearer
+#   X_SEARCH_SSH=<ssh host alias>   # alternative: run curl on that host against its loopback port (no token needed)
 #   X_SEARCH_PORT=31890             # loopback port used in ssh mode (default 31890)
 #
 # `--backend grok|remote|auto` overrides; auto = remote when configured and the
@@ -796,10 +797,11 @@ def remote_target() -> dict[str, str] | None:
     ssh = os.environ.get("X_SEARCH_SSH", "").strip()
     url = os.environ.get("X_SEARCH_URL", "").strip()
     port = os.environ.get("X_SEARCH_PORT", "31890").strip() or "31890"
-    if ssh:
-        return {"kind": "ssh", "host": ssh, "url": f"http://127.0.0.1:{port}"}
+    token = os.environ.get("X_SEARCH_TOKEN", "").strip()
     if url:
-        return {"kind": "http", "url": url.rstrip("/")}
+        return {"kind": "http", "url": url.rstrip("/"), "token": token}
+    if ssh:
+        return {"kind": "ssh", "host": ssh, "url": f"http://127.0.0.1:{port}", "token": token}
     return None
 
 
@@ -821,9 +823,10 @@ def choose_backend(args: argparse.Namespace) -> str:
 def remote_call(target: dict[str, str], path: str, payload: dict[str, Any] | None, timeout: float) -> tuple[int, dict[str, Any]]:
     """POST `payload` (or GET when None) to the backend; returns (status, json)."""
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    auth = {"authorization": f"Bearer {target['token']}"} if target.get("token") else {}
     if target["kind"] == "http":
         req = urllib.request.Request(target["url"] + path, data=body, method="GET" if body is None else "POST",
-                                     headers={} if body is None else {"content-type": "application/json"})
+                                     headers={**auth, **({} if body is None else {"content-type": "application/json"})})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
@@ -836,7 +839,9 @@ def remote_call(target: dict[str, str], path: str, payload: dict[str, Any] | Non
             raise AcpError(f"cannot reach {target['url']}: {e}") from None
     # ssh mode: the request body travels on stdin; curl runs on the remote host against loopback.
     url = target["url"] + path
-    curl = f"curl -s -m {int(timeout)} -w '\\n%{{http_code}}' " + ("" if body is None else "-H content-type:application/json --data-binary @- ") + shlex.quote(url)
+    # The token travels inside the ssh session as a curl header; it never appears in a local process list.
+    auth_flag = f"-H {shlex.quote('authorization: Bearer ' + target['token'])} " if target.get("token") else ""
+    curl = f"curl -s -m {int(timeout)} -w '\\n%{{http_code}}' {auth_flag}" + ("" if body is None else "-H content-type:application/json --data-binary @- ") + shlex.quote(url)
     try:
         proc = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", target["host"], curl],
                               input=body, capture_output=True, timeout=timeout + 30)
@@ -896,7 +901,9 @@ def cmd_remote(args: argparse.Namespace) -> int:
     if not data.get("ok"):
         code, msg = data.get("code", "INTERNAL"), data.get("message", f"HTTP {status}")
         hint = ""
-        if code == "SESSION_EXPIRED":
+        if code == "UNAUTHORIZED":
+            hint = "\nSet X_SEARCH_TOKEN to the endpoint's bearer token (or use X_SEARCH_SSH from a host that can reach the loopback port)."
+        elif code == "SESSION_EXPIRED":
             hint = "\nRe-import the X cookies on the server (deploy/README.md in dsh-x-search), then restart x-search.service."
         elif code == "RATE_LIMITED":
             hint = f"\nRetry after ~{int(data.get('retryAfterMs', 0) / 1000)}s."
@@ -956,11 +963,14 @@ def remote_check() -> None:
     if target is None:
         print("\nx-search   not configured (set X_SEARCH_SSH=<host> or X_SEARCH_URL=http://… to serve x/user/thread yourself)")
         return
-    print(f"\nx-search   {target['kind']} {target.get('host') or target['url']}")
+    print(f"\nx-search   {target['kind']} {target.get('host') or target['url']} · token {'set' if target.get('token') else 'not set'}")
     try:
         status, data = remote_call(target, "/api/status", None, 30)
     except AcpError as e:
         print(f"  unreachable: {e}")
+        return
+    if status == 401:
+        print("  401 unauthorized — set X_SEARCH_TOKEN to the endpoint's bearer token")
         return
     browser = data.get("browser") or {}
     lim = data.get("limiter") or {}
