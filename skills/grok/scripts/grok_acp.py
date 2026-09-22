@@ -825,8 +825,10 @@ def remote_call(target: dict[str, str], path: str, payload: dict[str, Any] | Non
     body = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     auth = {"authorization": f"Bearer {target['token']}"} if target.get("token") else {}
     if target["kind"] == "http":
-        req = urllib.request.Request(target["url"] + path, data=body, method="GET" if body is None else "POST",
-                                     headers={**auth, **({} if body is None else {"content-type": "application/json"})})
+        # A real User-Agent: Cloudflare's browser integrity check answers 403 to urllib's default one.
+        headers = {**auth, "user-agent": "grok-skill/1.0 (+https://github.com/loadchange/skills)", "accept": "application/json",
+                   **({} if body is None else {"content-type": "application/json"})}
+        req = urllib.request.Request(target["url"] + path, data=body, method="GET" if body is None else "POST", headers=headers)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.status, json.loads(resp.read().decode("utf-8") or "{}")
